@@ -245,6 +245,18 @@ where
         self.set_address_window(sx, sy, ex, ey)?;
         self.write_pixels_buffered(colors)
     }
+
+    /// Allows adjusting gamma correction on the display.
+    /// 
+    /// Takes in an array `pos` for positive polarity correction and an array `neg` for negative polarity correction.
+    /// 
+    /// The following values worked well on an ST7735S test device:
+    /// pos: &[0x10, 0x0E, 0x02, 0x03, 0x0E, 0x07, 0x02, 0x07, 0x0A, 0x12, 0x27, 0x37, 0x00, 0x0D, 0x0E, 0x10]
+    /// neg: &[0x10, 0x0E, 0x03, 0x03, 0x0F, 0x06, 0x02, 0x08, 0x0A, 0x13, 0x26, 0x36, 0x00, 0x0D, 0x0E, 0x10]
+    pub fn adjust_gamma(&mut self, pos: &[u8;16], neg: &[u8;16]) -> Result<(), ()> {
+        self.write_command(Instruction::GMCTRP1, pos)?;
+        self.write_command(Instruction::GMCTRN1, neg)
+    }
 }
 
 #[cfg(feature = "graphics")]
