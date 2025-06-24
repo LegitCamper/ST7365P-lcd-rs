@@ -1,17 +1,17 @@
 #![no_std]
 
-//! This crate provides a ST7735 driver to connect to TFT displays.
+//! This crate provides a ST7365P driver to connect to TFT displays.
 
 pub mod instruction;
 
 use crate::instruction::Instruction;
 
 use embedded_hal::delay::DelayNs;
-use embedded_hal::spi;
 use embedded_hal::digital::OutputPin;
+use embedded_hal::spi;
 
-/// ST7735 driver to connect to TFT displays.
-pub struct ST7735<SPI, DC, RST>
+/// ST7365P driver to connect to TFT displays.
+pub struct ST7365P<SPI, DC, RST>
 where
     SPI: spi::SpiDevice,
     DC: OutputPin,
@@ -48,7 +48,7 @@ pub enum Orientation {
     LandscapeSwapped = 0xA0,
 }
 
-impl<SPI, DC, RST> ST7735<SPI, DC, RST>
+impl<SPI, DC, RST> ST7365P<SPI, DC, RST>
 where
     SPI: spi::SpiDevice,
     DC: OutputPin,
@@ -64,7 +64,7 @@ where
         width: u32,
         height: u32,
     ) -> Self {
-        let display = ST7735 {
+        let display = ST7365P {
             spi,
             dc,
             rst,
@@ -92,13 +92,6 @@ where
         self.write_command(Instruction::FRMCTR1, &[0x01, 0x2C, 0x2D])?;
         self.write_command(Instruction::FRMCTR2, &[0x01, 0x2C, 0x2D])?;
         self.write_command(Instruction::FRMCTR3, &[0x01, 0x2C, 0x2D, 0x01, 0x2C, 0x2D])?;
-        self.write_command(Instruction::INVCTR, &[0x07])?;
-        self.write_command(Instruction::PWCTR1, &[0xA2, 0x02, 0x84])?;
-        self.write_command(Instruction::PWCTR2, &[0xC5])?;
-        self.write_command(Instruction::PWCTR3, &[0x0A, 0x00])?;
-        self.write_command(Instruction::PWCTR4, &[0x8A, 0x2A])?;
-        self.write_command(Instruction::PWCTR5, &[0x8A, 0xEE])?;
-        self.write_command(Instruction::VMCTR1, &[0x0E])?;
         if self.inverted {
             self.write_command(Instruction::INVON, &[])?;
         } else {
@@ -247,15 +240,15 @@ where
     }
 
     /// Allows adjusting gamma correction on the display.
-    /// 
+    ///
     /// Takes in an array `pos` for positive polarity correction and an array `neg` for negative polarity correction.
-    /// 
-    /// The following values worked well on an ST7735S test device:
+    ///
+    /// The following values worked well on an ST7365PS test device:
     /// pos: &[0x10, 0x0E, 0x02, 0x03, 0x0E, 0x07, 0x02, 0x07, 0x0A, 0x12, 0x27, 0x37, 0x00, 0x0D, 0x0E, 0x10]
     /// neg: &[0x10, 0x0E, 0x03, 0x03, 0x0F, 0x06, 0x02, 0x08, 0x0A, 0x13, 0x26, 0x36, 0x00, 0x0D, 0x0E, 0x10]
-    pub fn adjust_gamma(&mut self, pos: &[u8;16], neg: &[u8;16]) -> Result<(), ()> {
-        self.write_command(Instruction::GMCTRP1, pos)?;
-        self.write_command(Instruction::GMCTRN1, neg)
+    pub fn adjust_gamma(&mut self, pos: &[u8; 16], neg: &[u8; 16]) -> Result<(), ()> {
+        self.write_command(Instruction::PGC, pos)?;
+        self.write_command(Instruction::NGC, neg)
     }
 }
 
@@ -273,7 +266,7 @@ use self::embedded_graphics_core::{
 };
 
 #[cfg(feature = "graphics")]
-impl<SPI, DC, RST> DrawTarget for ST7735<SPI, DC, RST>
+impl<SPI, DC, RST> DrawTarget for ST7365P<SPI, DC, RST>
 where
     SPI: spi::SpiDevice,
     DC: OutputPin,
@@ -340,7 +333,7 @@ where
 }
 
 #[cfg(feature = "graphics")]
-impl<SPI, DC, RST> OriginDimensions for ST7735<SPI, DC, RST>
+impl<SPI, DC, RST> OriginDimensions for ST7365P<SPI, DC, RST>
 where
     SPI: spi::SpiDevice,
     DC: OutputPin,

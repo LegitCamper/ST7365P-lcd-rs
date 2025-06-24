@@ -1,4 +1,4 @@
-/// ST7735 instructions.
+/// ST7365P instructions.
 #[derive(Debug, Clone, Copy)]
 pub enum Instruction {
     NOP = 0x00,
@@ -23,19 +23,9 @@ pub enum Instruction {
     FRMCTR1 = 0xB1,
     FRMCTR2 = 0xB2,
     FRMCTR3 = 0xB3,
-    INVCTR = 0xB4,
-    DISSET5 = 0xB6,
-    PWCTR1 = 0xC0,
-    PWCTR2 = 0xC1,
-    PWCTR3 = 0xC2,
-    PWCTR4 = 0xC3,
-    PWCTR5 = 0xC4,
-    VMCTR1 = 0xC5,
     RDID1 = 0xDA,
     RDID2 = 0xDB,
     RDID3 = 0xDC,
-    RDID4 = 0xDD,
-    PWCTR6 = 0xFC,
-    GMCTRP1 = 0xE0,
-    GMCTRN1 = 0xE1,
+    PGC = 0xE0,
+    NGC = 0xE1,
 }
