@@ -102,7 +102,7 @@ where
         } else {
             self.write_command(Instruction::MADCTL, &[0x08])?;
         }
-        self.write_command(Instruction::COLMOD, &[0x0])?;
+        self.write_command(Instruction::COLMOD, &[0x05])?;
 
         self.clear(RgbColor::BLACK)?;
 
@@ -165,7 +165,7 @@ where
     }
 
     pub fn set_orientation(&mut self, orientation: &Orientation) -> Result<(), ()> {
-        if self.rgb {
+        if !self.rgb {
             self.write_command(Instruction::MADCTL, &[*orientation as u8])?;
         } else {
             self.write_command(Instruction::MADCTL, &[*orientation as u8 | 0x08])?;
