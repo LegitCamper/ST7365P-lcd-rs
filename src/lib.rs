@@ -103,6 +103,9 @@ where
             self.write_command(Instruction::MADCTL, &[0x08])?;
         }
         self.write_command(Instruction::COLMOD, &[0x0])?;
+
+        self.clear(RgbColor::BLACK)?;
+
         self.write_command(Instruction::DISPON, &[])?;
         delay.delay_ms(200);
         Ok(())
@@ -243,9 +246,6 @@ where
     ///
     /// Takes in an array `pos` for positive polarity correction and an array `neg` for negative polarity correction.
     ///
-    /// The following values worked well on an ST7365PS test device:
-    /// pos: &[0x10, 0x0E, 0x02, 0x03, 0x0E, 0x07, 0x02, 0x07, 0x0A, 0x12, 0x27, 0x37, 0x00, 0x0D, 0x0E, 0x10]
-    /// neg: &[0x10, 0x0E, 0x03, 0x03, 0x0F, 0x06, 0x02, 0x08, 0x0A, 0x13, 0x26, 0x36, 0x00, 0x0D, 0x0E, 0x10]
     pub fn adjust_gamma(&mut self, pos: &[u8; 16], neg: &[u8; 16]) -> Result<(), ()> {
         self.write_command(Instruction::PGC, pos)?;
         self.write_command(Instruction::NGC, neg)
