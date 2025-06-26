@@ -164,6 +164,16 @@ where
         self.write_data(&buffer[0..index])
     }
 
+    /// ensure you are only setting the top 3 bits for MADCTL (x,y, and x+y)
+    pub fn set_custom_orientation(&mut self, mut madctl: u8) -> Result<(), ()> {
+        if !self.rgb {
+            madctl |= 0x08
+        }
+        self.write_command(Instruction::MADCTL, &[madctl])?;
+
+        Ok(())
+    }
+
     pub fn set_orientation(&mut self, orientation: &Orientation) -> Result<(), ()> {
         if self.rgb {
             self.write_command(Instruction::MADCTL, &[*orientation as u8])?;
