@@ -92,12 +92,12 @@ where
         self.write_command(Instruction::FRMCTR1, &[0x01, 0x2C, 0x2D])?;
         self.write_command(Instruction::FRMCTR2, &[0x01, 0x2C, 0x2D])?;
         self.write_command(Instruction::FRMCTR3, &[0x01, 0x2C, 0x2D, 0x01, 0x2C, 0x2D])?;
-        if !self.inverted {
+        if self.inverted {
             self.write_command(Instruction::INVON, &[])?;
         } else {
             self.write_command(Instruction::INVOFF, &[])?;
         }
-        if !self.rgb {
+        if self.rgb {
             self.write_command(Instruction::MADCTL, &[0x00])?;
         } else {
             self.write_command(Instruction::MADCTL, &[0x08])?;
@@ -165,7 +165,7 @@ where
     }
 
     pub fn set_orientation(&mut self, orientation: &Orientation) -> Result<(), ()> {
-        if !self.rgb {
+        if self.rgb {
             self.write_command(Instruction::MADCTL, &[*orientation as u8])?;
         } else {
             self.write_command(Instruction::MADCTL, &[*orientation as u8 | 0x08])?;
