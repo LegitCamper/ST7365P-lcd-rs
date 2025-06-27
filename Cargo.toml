@@ -12,6 +12,7 @@ repository = "https://github.com/legitcamper/st7365p-lcd-rs"
 readme = "README.md"
 
 [dependencies]
+embedded-hal-async = "1.0.0"
 embedded-hal = "1.0.0"
 nb = "1.1.0"
 
