@@ -107,7 +107,7 @@ where
         }
         self.write_command(Instruction::COLMOD, &[0x05]).await?;
 
-        // self.clear(RgbColor::BLACK)?;
+        self.clear().await?;
 
         self.write_command(Instruction::DISPON, &[]).await?;
         delay.delay_ms(200).await;
@@ -274,6 +274,17 @@ where
         self.write_command(Instruction::PGC, pos).await?;
         self.write_command(Instruction::NGC, neg).await
     }
+
+    // is dumb and slow but is just used for init
+    async fn clear(&mut self) -> Result<(), ()> {
+        for i in 0..self.width {
+            for j in 0..self.height {
+                self.set_pixel(i as u16, j as u16, 0).await?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// provides a synchronous abstraction above the display transport
@@ -308,8 +319,8 @@ where
             .set_pixels_buffered(
                 0,
                 0,
-                self.size().width as u16,
-                self.size().height as u16,
+                self.size().width as u16 - 1,
+                self.size().height as u16 - 1,
                 self.buffer.as_flattened(),
             )
             .await?;
@@ -317,7 +328,7 @@ where
     }
 
     fn set_pixel(&mut self, x: u16, y: u16, color: u16) -> Result<(), ()> {
-        if x > self.buffer.len() as u16 || y > self.buffer[0].len() as u16 {
+        if x > self.size().width as u16 - 1 || y > self.size().height as u16 - 1 {
             return Err(());
         }
 
@@ -340,10 +351,11 @@ where
         ey: u16,
         colors: P,
     ) -> Result<(), ()> {
-        let width = self.buffer.len() as u16;
-        let height = self.buffer[0].len() as u16;
-
-        if sx >= width || ex >= width || sy >= height || ey >= height {
+        if sx >= self.size().width as u16 - 1
+            || ex >= self.size().width as u16 - 1
+            || sy >= self.size().height as u16 - 1
+            || ey >= self.size().height as u16 - 1
+        {
             return Err(()); // Bounds check
         }
 
