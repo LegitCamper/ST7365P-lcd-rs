@@ -8,7 +8,7 @@ pub mod instruction;
 
 use crate::instruction::Instruction;
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::boxed::Box;
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::delay::DelayNs;
 use embedded_hal_async::spi::SpiDevice;
@@ -87,11 +87,11 @@ where
     where
         DELAY: DelayNs,
     {
-        self.hard_reset(delay)?;
+        self.hard_reset(delay).await?;
         self.write_command(Instruction::SWRESET, &[]).await?;
-        delay.delay_ms(200);
+        delay.delay_ms(200).await;
         self.write_command(Instruction::SLPOUT, &[]).await?;
-        delay.delay_ms(200);
+        delay.delay_ms(200).await;
         self.write_command(Instruction::FRMCTR1, &[0x01, 0x2C, 0x2D])
             .await?;
         self.write_command(Instruction::FRMCTR2, &[0x01, 0x2C, 0x2D])
@@ -113,19 +113,19 @@ where
         // self.clear(RgbColor::BLACK)?;
 
         self.write_command(Instruction::DISPON, &[]).await?;
-        delay.delay_ms(200);
+        delay.delay_ms(200).await;
         Ok(())
     }
 
-    pub fn hard_reset<DELAY>(&mut self, delay: &mut DELAY) -> Result<(), ()>
+    pub async fn hard_reset<DELAY>(&mut self, delay: &mut DELAY) -> Result<(), ()>
     where
         DELAY: DelayNs,
     {
         if let Some(rst) = &mut self.rst {
             rst.set_high().map_err(|_| ())?;
-            delay.delay_ms(10);
+            delay.delay_ms(10).await;
             rst.set_low().map_err(|_| ())?;
-            delay.delay_ms(10);
+            delay.delay_ms(10).await;
             rst.set_high().map_err(|_| ())?;
         }
         Ok(())
