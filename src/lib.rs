@@ -2,13 +2,10 @@
 
 //! This crate provides a ST7365P driver to connect to TFT displays.
 
-extern crate alloc;
-
 pub mod instruction;
 
 use crate::instruction::Instruction;
 
-use alloc::boxed::Box;
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::delay::DelayNs;
 use embedded_hal_async::spi::SpiDevice;
@@ -289,7 +286,7 @@ pub struct FrameBuffer<
     RST: OutputPin,
 > {
     display: ST7365P<SPI, DC, RST>,
-    buffer: Box<[[u16; WIDTH]; HEIGHT]>,
+    buffer: [[u16; WIDTH]; HEIGHT],
 }
 
 impl<const WIDTH: usize, const HEIGHT: usize, SPI, DC, RST> FrameBuffer<WIDTH, HEIGHT, SPI, DC, RST>
@@ -301,7 +298,7 @@ where
     pub fn new(display: ST7365P<SPI, DC, RST>) -> Self {
         Self {
             display,
-            buffer: Box::new([[0_u16; WIDTH]; HEIGHT]),
+            buffer: [[0_u16; WIDTH]; HEIGHT],
         }
     }
 
