@@ -3,12 +3,10 @@
 //! This crate provides a ST7365P driver to connect to TFT displays.
 
 pub mod instruction;
-
 use crate::instruction::Instruction;
 
 use embedded_hal::digital::OutputPin;
-use embedded_hal_async::delay::DelayNs;
-use embedded_hal_async::spi::SpiDevice;
+use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
 
 /// ST7365P driver to connect to TFT displays.
 pub struct ST7365P<SPI, DC, RST>
@@ -107,8 +105,14 @@ where
         }
         self.write_command(Instruction::COLMOD, &[0x05]).await?;
 
-        self.clear().await?;
+        Ok(())
+    }
 
+    /// Turns display on after init
+    pub async fn set_on<DELAY>(&mut self, delay: &mut DELAY) -> Result<(), ()>
+    where
+        DELAY: DelayNs,
+    {
         self.write_command(Instruction::DISPON, &[]).await?;
         delay.delay_ms(200).await;
         Ok(())
@@ -274,17 +278,6 @@ where
         self.write_command(Instruction::PGC, pos).await?;
         self.write_command(Instruction::NGC, neg).await
     }
-
-    // is dumb and slow but is just used for init
-    async fn clear(&mut self) -> Result<(), ()> {
-        for i in 0..self.width {
-            for j in 0..self.height {
-                self.set_pixel(i as u16, j as u16, 0).await?;
-            }
-        }
-
-        Ok(())
-    }
 }
 
 /// provides a synchronous abstraction above the display transport
@@ -296,7 +289,7 @@ pub struct FrameBuffer<
     DC: OutputPin,
     RST: OutputPin,
 > {
-    display: ST7365P<SPI, DC, RST>,
+    pub display: ST7365P<SPI, DC, RST>,
     buffer: [[u16; WIDTH]; HEIGHT],
 }
 
@@ -311,6 +304,18 @@ where
             display,
             buffer: [[0_u16; WIDTH]; HEIGHT],
         }
+    }
+
+    /// helper function which inits the screen black before turning it on
+    #[cfg(feature = "graphics")]
+    pub async fn init<DELAY>(&mut self, delay: &mut DELAY) -> Result<(), ()>
+    where
+        DELAY: DelayNs,
+    {
+        self.display.init(delay).await?;
+        self.draw().await?; // inits black
+        self.display.set_on(delay).await?;
+        Ok(())
     }
 
     /// needs to be called to send framebuffer to underlying display asynchronously
