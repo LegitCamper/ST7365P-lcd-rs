@@ -11,11 +11,12 @@ use embedded_hal::digital::OutputPin;
 use embedded_hal::spi;
 
 /// ST7365P driver to connect to TFT displays.
-pub struct ST7365P<SPI, DC, RST>
+pub struct ST7365P<SPI, DC, RST, DELAY>
 where
     SPI: spi::SpiDevice,
     DC: OutputPin,
     RST: OutputPin,
+    DELAY: DelayNs,
 {
     /// SPI
     spi: SPI,
@@ -37,6 +38,9 @@ where
     dy: u16,
     width: u32,
     height: u32,
+
+    /// Delay
+    delay: DELAY,
 }
 
 /// Display orientation.
@@ -48,11 +52,12 @@ pub enum Orientation {
     LandscapeSwapped = 0xA0,
 }
 
-impl<SPI, DC, RST> ST7365P<SPI, DC, RST>
+impl<SPI, DC, RST, DELAY> ST7365P<SPI, DC, RST, DELAY>
 where
     SPI: spi::SpiDevice,
     DC: OutputPin,
     RST: OutputPin,
+    DELAY: DelayNs,
 {
     /// Creates a new driver instance that uses hardware SPI.
     pub fn new(
@@ -63,6 +68,7 @@ where
         inverted: bool,
         width: u32,
         height: u32,
+        delay: DELAY,
     ) -> Self {
         let display = ST7365P {
             spi,
@@ -74,21 +80,21 @@ where
             dy: 0,
             width,
             height,
+            delay,
         };
 
         display
     }
 
     /// Runs commands to initialize the display.
-    pub fn init<DELAY>(&mut self, delay: &mut DELAY) -> Result<(), ()>
-    where
-        DELAY: DelayNs,
+    pub fn init(&mut self) -> Result<(), ()>
     {
-        self.hard_reset(delay)?;
+        self.hard_reset()?;
         self.write_command(Instruction::SWRESET, &[])?;
-        delay.delay_ms(200);
+        self.delay.delay_ms(200);
         self.write_command(Instruction::SLPOUT, &[])?;
-        delay.delay_ms(200);
+        self.delay.delay_ms(200);
+
         self.write_command(Instruction::FRMCTR1, &[0x01, 0x2C, 0x2D])?;
         self.write_command(Instruction::FRMCTR2, &[0x01, 0x2C, 0x2D])?;
         self.write_command(Instruction::FRMCTR3, &[0x01, 0x2C, 0x2D, 0x01, 0x2C, 0x2D])?;
@@ -107,25 +113,27 @@ where
         self.clear(RgbColor::BLACK)?;
 
         self.write_command(Instruction::DISPON, &[])?;
-        delay.delay_ms(200);
+        self.delay.delay_ms(200);
         Ok(())
     }
 
-    pub fn hard_reset<DELAY>(&mut self, delay: &mut DELAY) -> Result<(), ()>
+    pub fn hard_reset(&mut self) -> Result<(), ()>
     where
         DELAY: DelayNs,
     {
         if let Some(rst) = &mut self.rst {
             rst.set_high().map_err(|_| ())?;
-            delay.delay_ms(10);
+            self.delay.delay_ms(10);
             rst.set_low().map_err(|_| ())?;
-            delay.delay_ms(10);
+            self.delay.delay_ms(10);
             rst.set_high().map_err(|_| ())?;
         }
         Ok(())
     }
 
     fn write_command(&mut self, command: Instruction, params: &[u8]) -> Result<(), ()> {
+        // delay amount empirically determined
+        self.delay.delay_ns(1);
         self.dc.set_low().map_err(|_| ())?;
         self.spi.write(&[command as u8]).map_err(|_| ())?;
         if !params.is_empty() {
@@ -140,6 +148,8 @@ where
     }
 
     fn write_data(&mut self, data: &[u8]) -> Result<(), ()> {
+        // delay amount empirically determined
+        self.delay.delay_ns(1);
         self.spi.write(data).map_err(|_| ())
     }
 
@@ -276,11 +286,12 @@ use self::embedded_graphics_core::{
 };
 
 #[cfg(feature = "graphics")]
-impl<SPI, DC, RST> DrawTarget for ST7365P<SPI, DC, RST>
+impl<SPI, DC, RST, DELAY> DrawTarget for ST7365P<SPI, DC, RST, DELAY>
 where
     SPI: spi::SpiDevice,
     DC: OutputPin,
     RST: OutputPin,
+    DELAY: DelayNs,
 {
     type Error = ();
     type Color = Rgb565;
@@ -343,11 +354,12 @@ where
 }
 
 #[cfg(feature = "graphics")]
-impl<SPI, DC, RST> OriginDimensions for ST7365P<SPI, DC, RST>
+impl<SPI, DC, RST, DELAY> OriginDimensions for ST7365P<SPI, DC, RST, DELAY>
 where
     SPI: spi::SpiDevice,
     DC: OutputPin,
     RST: OutputPin,
+    DELAY: DelayNs,
 {
     fn size(&self) -> Size {
         Size::new(self.width, self.height)
