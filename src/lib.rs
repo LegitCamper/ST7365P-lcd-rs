@@ -33,8 +33,6 @@ where
     /// Global image offset
     dx: u16,
     dy: u16,
-    width: u32,
-    height: u32,
 }
 
 /// Display orientation.
@@ -53,15 +51,7 @@ where
     RST: OutputPin,
 {
     /// Creates a new driver instance that uses hardware SPI.
-    pub fn new(
-        spi: SPI,
-        dc: DC,
-        rst: Option<RST>,
-        rgb: bool,
-        inverted: bool,
-        width: u32,
-        height: u32,
-    ) -> Self {
+    pub fn new(spi: SPI, dc: DC, rst: Option<RST>, rgb: bool, inverted: bool) -> Self {
         let display = ST7365P {
             spi,
             dc,
@@ -70,8 +60,6 @@ where
             inverted,
             dx: 0,
             dy: 0,
-            width,
-            height,
         };
 
         display
@@ -282,45 +270,28 @@ where
 
 /// provides a synchronous abstraction above the display transport
 /// for embedded-graphics to write to, ensure you periodically push the framebuffer
-pub struct FrameBuffer<
-    const WIDTH: usize,
-    const HEIGHT: usize,
-    SPI: SpiDevice,
-    DC: OutputPin,
-    RST: OutputPin,
-> {
-    pub display: ST7365P<SPI, DC, RST>,
+pub struct FrameBuffer<const WIDTH: usize, const HEIGHT: usize> {
     buffer: [[u16; WIDTH]; HEIGHT],
 }
 
-impl<const WIDTH: usize, const HEIGHT: usize, SPI, DC, RST> FrameBuffer<WIDTH, HEIGHT, SPI, DC, RST>
-where
-    SPI: SpiDevice,
-    DC: OutputPin,
-    RST: OutputPin,
-{
-    pub fn new(display: ST7365P<SPI, DC, RST>) -> Self {
+impl<const WIDTH: usize, const HEIGHT: usize> FrameBuffer<WIDTH, HEIGHT> {
+    pub fn new() -> Self {
         Self {
-            display,
             buffer: [[0_u16; WIDTH]; HEIGHT],
         }
     }
 
-    /// helper function which inits the screen black before turning it on
-    #[cfg(feature = "graphics")]
-    pub async fn init<DELAY>(&mut self, delay: &mut DELAY) -> Result<(), ()>
-    where
-        DELAY: DelayNs,
-    {
-        self.display.init(delay).await?;
-        self.draw().await?; // inits black
-        self.display.set_on(delay).await?;
-        Ok(())
-    }
-
     /// needs to be called to send framebuffer to underlying display asynchronously
-    pub async fn draw(&mut self) -> Result<(), ()> {
-        self.display
+    pub async fn draw<SPI, DC, RST>(
+        &mut self,
+        display: &mut ST7365P<SPI, DC, RST>,
+    ) -> Result<(), ()>
+    where
+        SPI: SpiDevice,
+        DC: OutputPin,
+        RST: OutputPin,
+    {
+        display
             .set_pixels_buffered(
                 0,
                 0,
@@ -399,13 +370,7 @@ use self::embedded_graphics_core::{
 };
 
 #[cfg(feature = "graphics")]
-impl<const WIDTH: usize, const HEIGHT: usize, SPI, DC, RST> DrawTarget
-    for FrameBuffer<WIDTH, HEIGHT, SPI, DC, RST>
-where
-    SPI: SpiDevice,
-    DC: OutputPin,
-    RST: OutputPin,
-{
+impl<const WIDTH: usize, const HEIGHT: usize> DrawTarget for FrameBuffer<WIDTH, HEIGHT> {
     type Error = ();
     type Color = Rgb565;
 
@@ -417,8 +382,8 @@ where
             // Only draw pixels that would be on screen
             if coord.x >= 0
                 && coord.y >= 0
-                && coord.x < self.display.width as i32
-                && coord.y < self.display.height as i32
+                && coord.x < self.size().width as i32
+                && coord.y < self.size().height as i32
             {
                 self.set_pixel(
                     coord.x as u16,
@@ -467,14 +432,8 @@ where
 }
 
 #[cfg(feature = "graphics")]
-impl<const WIDTH: usize, const HEIGHT: usize, SPI, DC, RST> OriginDimensions
-    for FrameBuffer<WIDTH, HEIGHT, SPI, DC, RST>
-where
-    SPI: SpiDevice,
-    DC: OutputPin,
-    RST: OutputPin,
-{
+impl<const WIDTH: usize, const HEIGHT: usize> OriginDimensions for FrameBuffer<WIDTH, HEIGHT> {
     fn size(&self) -> Size {
-        Size::new(self.display.width, self.display.height)
+        Size::new(WIDTH as u32, HEIGHT as u32)
     }
 }
