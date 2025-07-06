@@ -9,11 +9,12 @@ use embedded_hal::digital::OutputPin;
 use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
 
 /// ST7365P driver to connect to TFT displays.
-pub struct ST7365P<SPI, DC, RST>
+pub struct ST7365P<SPI, DC, RST, DELAY>
 where
     SPI: SpiDevice,
     DC: OutputPin,
     RST: OutputPin,
+    DELAY: DelayNs,
 {
     /// SPI
     spi: SPI,
@@ -33,6 +34,9 @@ where
     /// Global image offset
     dx: u16,
     dy: u16,
+
+    /// Delay
+    delay: DELAY,
 }
 
 /// Display orientation.
@@ -44,14 +48,24 @@ pub enum Orientation {
     LandscapeSwapped = 0xA0,
 }
 
-impl<SPI, DC, RST> ST7365P<SPI, DC, RST>
+impl<SPI, DC, RST, DELAY> ST7365P<SPI, DC, RST, DELAY>
 where
     SPI: SpiDevice,
     DC: OutputPin,
     RST: OutputPin,
+    DELAY: DelayNs,
 {
     /// Creates a new driver instance that uses hardware SPI.
-    pub fn new(spi: SPI, dc: DC, rst: Option<RST>, rgb: bool, inverted: bool) -> Self {
+    pub fn new(
+        spi: SPI,
+        dc: DC,
+        rst: Option<RST>,
+        rgb: bool,
+        inverted: bool,
+        width: u32,
+        height: u32,
+        delay: DELAY,
+    ) -> Self {
         let display = ST7365P {
             spi,
             dc,
@@ -60,21 +74,20 @@ where
             inverted,
             dx: 0,
             dy: 0,
+            delay,
         };
 
         display
     }
 
     /// Runs commands to initialize the display.
-    pub async fn init<DELAY>(&mut self, delay: &mut DELAY) -> Result<(), ()>
-    where
-        DELAY: DelayNs,
-    {
-        self.hard_reset(delay).await?;
+    pub async fn init(&mut self) -> Result<(), ()> {
+        self.hard_reset().await?;
         self.write_command(Instruction::SWRESET, &[]).await?;
-        delay.delay_ms(200).await;
+        self.delay.delay_ms(200);
         self.write_command(Instruction::SLPOUT, &[]).await?;
-        delay.delay_ms(200).await;
+        self.delay.delay_ms(200);
+
         self.write_command(Instruction::FRMCTR1, &[0x01, 0x2C, 0x2D])
             .await?;
         self.write_command(Instruction::FRMCTR2, &[0x01, 0x2C, 0x2D])
@@ -97,30 +110,32 @@ where
     }
 
     /// Turns display on after init
-    pub async fn set_on<DELAY>(&mut self, delay: &mut DELAY) -> Result<(), ()>
+    pub async fn set_on(&mut self) -> Result<(), ()>
     where
         DELAY: DelayNs,
     {
         self.write_command(Instruction::DISPON, &[]).await?;
-        delay.delay_ms(200).await;
+        self.delay.delay_ms(200).await;
         Ok(())
     }
 
-    pub async fn hard_reset<DELAY>(&mut self, delay: &mut DELAY) -> Result<(), ()>
+    pub async fn hard_reset(&mut self) -> Result<(), ()>
     where
         DELAY: DelayNs,
     {
         if let Some(rst) = &mut self.rst {
             rst.set_high().map_err(|_| ())?;
-            delay.delay_ms(10).await;
+            self.delay.delay_ms(10).await;
             rst.set_low().map_err(|_| ())?;
-            delay.delay_ms(10).await;
+            self.delay.delay_ms(10).await;
             rst.set_high().map_err(|_| ())?;
         }
         Ok(())
     }
 
     async fn write_command(&mut self, command: Instruction, params: &[u8]) -> Result<(), ()> {
+        // delay amount empirically determined
+        self.delay.delay_ns(1);
         self.dc.set_low().map_err(|_| ())?;
         self.spi.write(&[command as u8]).await.map_err(|_| ())?;
         if !params.is_empty() {
@@ -135,6 +150,8 @@ where
     }
 
     async fn write_data(&mut self, data: &[u8]) -> Result<(), ()> {
+        // delay amount empirically determined
+        self.delay.delay_ns(1);
         self.spi.write(data).await.map_err(|_| ())
     }
 
@@ -282,9 +299,9 @@ impl<const WIDTH: usize, const HEIGHT: usize> FrameBuffer<WIDTH, HEIGHT> {
     }
 
     /// needs to be called to send framebuffer to underlying display asynchronously
-    pub async fn draw<SPI, DC, RST>(
+    pub async fn draw<SPI, DC, RST, DELAY: DelayNs>(
         &mut self,
-        display: &mut ST7365P<SPI, DC, RST>,
+        display: &mut ST7365P<SPI, DC, RST, DELAY>,
     ) -> Result<(), ()>
     where
         SPI: SpiDevice,
