@@ -62,11 +62,9 @@ where
         rst: Option<RST>,
         rgb: bool,
         inverted: bool,
-        width: u32,
-        height: u32,
         delay: DELAY,
     ) -> Self {
-        let display = ST7365P {
+        ST7365P {
             spi,
             dc,
             rst,
@@ -75,18 +73,16 @@ where
             dx: 0,
             dy: 0,
             delay,
-        };
-
-        display
+        }
     }
 
     /// Runs commands to initialize the display.
     pub async fn init(&mut self) -> Result<(), ()> {
         self.hard_reset().await?;
         self.write_command(Instruction::SWRESET, &[]).await?;
-        self.delay.delay_ms(200);
+        self.delay.delay_ms(200).await;
         self.write_command(Instruction::SLPOUT, &[]).await?;
-        self.delay.delay_ms(200);
+        self.delay.delay_ms(200).await;
 
         self.write_command(Instruction::FRMCTR1, &[0x01, 0x2C, 0x2D])
             .await?;
@@ -135,7 +131,7 @@ where
 
     async fn write_command(&mut self, command: Instruction, params: &[u8]) -> Result<(), ()> {
         // delay amount empirically determined
-        self.delay.delay_ns(1);
+        self.delay.delay_ns(1).await;
         self.dc.set_low().map_err(|_| ())?;
         self.spi.write(&[command as u8]).await.map_err(|_| ())?;
         if !params.is_empty() {
@@ -151,7 +147,7 @@ where
 
     async fn write_data(&mut self, data: &[u8]) -> Result<(), ()> {
         // delay amount empirically determined
-        self.delay.delay_ns(1);
+        self.delay.delay_ns(1).await;
         self.spi.write(data).await.map_err(|_| ())
     }
 
