@@ -9,13 +9,13 @@ use embassy_rp::{
     gpio::{Level, Output},
     spi,
 };
-use embassy_time::{Delay, Timer};
+use embassy_time::Delay;
 use embedded_graphics::{
-    image::Image, mono_font::ascii::FONT_10X20, mono_font::MonoTextStyle, pixelcolor::Rgb565,
-    prelude::*, primitives::PrimitiveStyle, text::Text, Drawable,
+    image::Image, pixelcolor::Rgb565,
+    prelude::*, Drawable,
 };
 use embedded_hal_bus::spi::ExclusiveDevice;
-use st7365p_lcd::{Orientation, ST7365P};
+use st7365p_lcd::ST7365P;
 use tinybmp::Bmp;
 
 const SCREEN_WIDTH: usize = 320;
