@@ -6,4 +6,4 @@ Two versions:
 - Synchrouous (which is in master branch)
 - Asyncrounous `branch = "async"`
 
-![ferris-demo](https://i.imgur.com/T1086fn.jpg)
+![picocalc-example](https://github.com/LegitCamper/ST7365P-lcd-rs/blob/master/assets/picocalc-example.jpg)

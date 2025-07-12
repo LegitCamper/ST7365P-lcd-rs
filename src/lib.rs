@@ -87,8 +87,7 @@ where
     }
 
     /// Runs commands to initialize the display.
-    pub fn init(&mut self) -> Result<(), ()>
-    {
+    pub fn init(&mut self) -> Result<(), ()> {
         self.hard_reset()?;
         self.write_command(Instruction::SWRESET, &[])?;
         self.delay.delay_ms(200);
