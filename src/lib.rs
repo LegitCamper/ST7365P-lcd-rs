@@ -288,7 +288,7 @@ pub struct FrameBuffer<const WIDTH: usize, const HEIGHT: usize> {
 }
 
 impl<const WIDTH: usize, const HEIGHT: usize> FrameBuffer<WIDTH, HEIGHT> {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             buffer: [[0_u16; WIDTH]; HEIGHT],
         }
