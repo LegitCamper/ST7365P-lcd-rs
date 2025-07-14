@@ -15,6 +15,7 @@ readme = "README.md"
 embedded-hal-async = "1.0.0"
 embedded-hal = "1.0.0"
 nb = "1.1.0"
+bitvec = { version = "1.0.1", default-features = false }
 
 [dependencies.embedded-graphics-core]
 version = "0.4"

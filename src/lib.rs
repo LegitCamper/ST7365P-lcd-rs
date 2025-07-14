@@ -5,6 +5,7 @@
 pub mod instruction;
 use crate::instruction::Instruction;
 
+use bitvec::{bitarr, order::Lsb0, BitArr};
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
 
@@ -281,10 +282,14 @@ where
     }
 }
 
+const TILE_SIZE: usize = 16; // 16x16 tile
+const TILE_COUNT: usize = (320 / TILE_SIZE) * (480 / TILE_SIZE); // 600 tiles
+
 /// provides a synchronous abstraction above the display transport
 /// for embedded-graphics to write to, ensure you periodically push the framebuffer
 pub struct FrameBuffer<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> {
     buffer: [u16; SIZE],
+    dirty_tiles: BitArr!(for TILE_COUNT, in usize, Lsb0),
 }
 
 impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WIDTH, HEIGHT, SIZE> {
@@ -305,10 +310,17 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
         );
         Self {
             buffer: [0_u16; SIZE],
+            dirty_tiles: bitarr!(usize, Lsb0; 0;TILE_COUNT),
         }
     }
 
-    /// needs to be called to send framebuffer to underlying display asynchronously
+    fn tile_index(x: usize, y: usize) -> usize {
+        let tile_x = x / TILE_SIZE;
+        let tile_y = y / TILE_SIZE;
+        tile_y * ((WIDTH + TILE_SIZE - 1) / TILE_SIZE) + tile_x
+    }
+
+    /// Sends the entire framebuffer to the display
     pub async fn draw<SPI, DC, RST, DELAY: DelayNs>(
         &mut self,
         display: &mut ST7365P<SPI, DC, RST, DELAY>,
@@ -327,6 +339,70 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
                 &self.buffer,
             )
             .await?;
+
+        self.dirty_tiles.fill(false);
+
+        Ok(())
+    }
+
+    /// Sends only dirty tiles (16x16px) individually to the display without batching
+    pub async fn partial_draw<SPI, DC, RST, DELAY: DelayNs>(
+        &mut self,
+        display: &mut ST7365P<SPI, DC, RST, DELAY>,
+    ) -> Result<(), ()>
+    where
+        SPI: SpiDevice,
+        DC: OutputPin,
+        RST: OutputPin,
+    {
+        const TILE_SIZE: usize = 16;
+        let tiles_x = (WIDTH + TILE_SIZE - 1) / TILE_SIZE;
+        let tiles_y = (HEIGHT + TILE_SIZE - 1) / TILE_SIZE;
+
+        // Temporary buffer for one tile's pixels
+        let mut tile_buffer = [0u16; TILE_SIZE * TILE_SIZE];
+
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                if !self.dirty_tiles[ty * tiles_x + tx] {
+                    continue;
+                }
+
+                let x = tx * TILE_SIZE;
+                let y = ty * TILE_SIZE;
+
+                // Copy pixels for the tile into tile_buffer
+                for row in 0..TILE_SIZE {
+                    for col in 0..TILE_SIZE {
+                        let actual_x = x + col;
+                        let actual_y = y + row;
+
+                        if actual_x < WIDTH && actual_y < HEIGHT {
+                            let idx = actual_y * WIDTH + actual_x;
+                            tile_buffer[row * TILE_SIZE + col] = self.buffer[idx];
+                        } else {
+                            // Out of bounds, fill with zero (or background)
+                            tile_buffer[row * TILE_SIZE + col] = 0;
+                        }
+                    }
+                }
+
+                // Send the tile's pixel data to the display
+                display
+                    .set_pixels_buffered(
+                        x as u16,
+                        y as u16,
+                        (x + TILE_SIZE - 1).min(WIDTH - 1) as u16,
+                        (y + TILE_SIZE - 1).min(HEIGHT - 1) as u16,
+                        &tile_buffer,
+                    )
+                    .await?;
+
+                // Mark tile as clean
+                self.dirty_tiles.set(ty * tiles_x + tx, false);
+            }
+        }
+
         Ok(())
     }
 
@@ -336,6 +412,10 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
         }
 
         self.buffer[(y as usize * WIDTH) + x as usize] = color;
+        self.dirty_tiles
+            .get_mut(Self::tile_index(x.into(), y.into()))
+            .unwrap()
+            .set(true);
 
         Ok(())
     }
@@ -362,6 +442,10 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
             for x in sx..=ex {
                 if let Some(color) = color_iter.next() {
                     self.buffer[(y as usize * WIDTH) + x as usize] = color;
+                    self.dirty_tiles
+                        .get_mut(Self::tile_index(x.into(), y.into()))
+                        .unwrap()
+                        .set(true);
                 } else {
                     return Err(()); // Not enough data
                 }
@@ -450,7 +534,10 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
             self.size().height as u16 - 1,
             core::iter::repeat(RawU16::from(color).into_inner())
                 .take((self.size().width * self.size().height) as usize),
-        )
+        )?;
+
+        self.dirty_tiles.fill(false);
+        Ok(())
     }
 }
 

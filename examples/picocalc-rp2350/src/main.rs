@@ -53,7 +53,7 @@ async fn main(_spawner: Spawner) {
     let image = Image::new(&bmp, Point::new(0, 0));
 
     image.draw(&mut framebuffer).unwrap();
-    framebuffer.draw(&mut display).await.unwrap();
+    framebuffer.partial_draw(&mut display).await.unwrap();
 
     loop {}
 }
