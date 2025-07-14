@@ -283,14 +283,28 @@ where
 
 /// provides a synchronous abstraction above the display transport
 /// for embedded-graphics to write to, ensure you periodically push the framebuffer
-pub struct FrameBuffer<const WIDTH: usize, const HEIGHT: usize> {
-    buffer: [[u16; WIDTH]; HEIGHT],
+pub struct FrameBuffer<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> {
+    buffer: [u16; SIZE],
 }
 
-impl<const WIDTH: usize, const HEIGHT: usize> FrameBuffer<WIDTH, HEIGHT> {
-    pub const fn new() -> Self {
+impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WIDTH, HEIGHT, SIZE> {
+    /// Constructs a new framebuffer.
+    ///
+    /// # Panics
+    /// Panics if `SIZE != WIDTH * HEIGHT`. This contract is not enforced
+    /// by the Rust compiler on stable and must be upheld by the caller.
+    pub fn new() -> Self {
+        assert!(WIDTH > 0, "Framebuffer WIDTH must be > 0");
+        assert!(HEIGHT > 0, "Framebuffer HEIGHT must be > 0");
+        assert_eq!(
+            SIZE,
+            WIDTH * HEIGHT,
+            "Framebuffer size mismatch: SIZE must equal WIDTH * HEIGHT ({} * {})",
+            WIDTH,
+            HEIGHT
+        );
         Self {
-            buffer: [[0_u16; WIDTH]; HEIGHT],
+            buffer: [0_u16; SIZE],
         }
     }
 
@@ -310,7 +324,7 @@ impl<const WIDTH: usize, const HEIGHT: usize> FrameBuffer<WIDTH, HEIGHT> {
                 0,
                 self.size().width as u16 - 1,
                 self.size().height as u16 - 1,
-                self.buffer.as_flattened(),
+                &self.buffer,
             )
             .await?;
         Ok(())
@@ -321,13 +335,7 @@ impl<const WIDTH: usize, const HEIGHT: usize> FrameBuffer<WIDTH, HEIGHT> {
             return Err(());
         }
 
-        for (i, row) in self.buffer.iter_mut().enumerate() {
-            for (j, col) in row.iter_mut().enumerate() {
-                if x == i as u16 && y == j as u16 {
-                    *col = color
-                }
-            }
-        }
+        self.buffer[(y as usize * WIDTH) + x as usize] = color;
 
         Ok(())
     }
@@ -353,7 +361,7 @@ impl<const WIDTH: usize, const HEIGHT: usize> FrameBuffer<WIDTH, HEIGHT> {
         for y in sy..=ey {
             for x in sx..=ex {
                 if let Some(color) = color_iter.next() {
-                    self.buffer[y as usize][x as usize] = color;
+                    self.buffer[(y as usize * WIDTH) + x as usize] = color;
                 } else {
                     return Err(()); // Not enough data
                 }
@@ -383,7 +391,9 @@ use self::embedded_graphics_core::{
 };
 
 #[cfg(feature = "graphics")]
-impl<const WIDTH: usize, const HEIGHT: usize> DrawTarget for FrameBuffer<WIDTH, HEIGHT> {
+impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
+    for FrameBuffer<WIDTH, HEIGHT, SIZE>
+{
     type Error = ();
     type Color = Rgb565;
 
@@ -445,7 +455,9 @@ impl<const WIDTH: usize, const HEIGHT: usize> DrawTarget for FrameBuffer<WIDTH, 
 }
 
 #[cfg(feature = "graphics")]
-impl<const WIDTH: usize, const HEIGHT: usize> OriginDimensions for FrameBuffer<WIDTH, HEIGHT> {
+impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> OriginDimensions
+    for FrameBuffer<WIDTH, HEIGHT, SIZE>
+{
     fn size(&self) -> Size {
         Size::new(WIDTH as u32, HEIGHT as u32)
     }

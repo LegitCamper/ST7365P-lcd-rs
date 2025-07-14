@@ -37,7 +37,11 @@ async fn main(_spawner: Spawner) {
         true,
         Delay,
     );
-    let mut framebuffer: FrameBuffer<SCREEN_WIDTH, SCREEN_HEIGHT> = FrameBuffer::new();
+    let mut framebuffer: FrameBuffer<
+        SCREEN_WIDTH,
+        SCREEN_HEIGHT,
+        { SCREEN_WIDTH * SCREEN_HEIGHT },
+    > = FrameBuffer::new();
 
     display.init().await.unwrap();
     display.set_custom_orientation(0x40).await.unwrap();
