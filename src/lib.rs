@@ -322,40 +322,6 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
         }
     }
 
-    fn bounding_rect<I>(pixels: I) -> Option<Rectangle>
-    where
-        I: IntoIterator<Item = Pixel<Rgb565>>,
-    {
-        use core::cmp::{max, min};
-        let mut min_x = usize::MAX;
-        let mut max_x = 0;
-        let mut min_y = usize::MAX;
-        let mut max_y = 0;
-
-        let mut any_pixel = false;
-
-        for Pixel(coord, _) in pixels {
-            if coord.x >= 0 && coord.y >= 0 {
-                let x = coord.x as usize;
-                let y = coord.y as usize;
-                min_x = min(min_x, x);
-                max_x = max(max_x, x);
-                min_y = min(min_y, y);
-                max_y = max(max_y, y);
-                any_pixel = true;
-            }
-        }
-
-        if any_pixel {
-            Some(Rectangle::new(
-                Point::new(min_x as i32, min_y as i32),
-                Size::new((max_x - min_x + 1) as u32, (max_y - min_y + 1) as u32),
-            ))
-        } else {
-            None
-        }
-    }
-
     fn mark_tiles_dirty(&mut self, rect: Rectangle) {
         let tiles_x = (WIDTH + TILE_SIZE - 1) / TILE_SIZE;
         let start_tx = (rect.top_left.x as usize) / TILE_SIZE;
@@ -472,7 +438,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
 
                 // Start meta-tile at this tile
                 let mut width_tiles = 1;
-                let mut height_tiles = 1;
+                let height_tiles = 1;
 
                 // Grow horizontally, but keep under MAX_TILES_PER_METATILE
                 while tx + width_tiles < tiles_x
@@ -642,15 +608,38 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
+        use core::cmp::{max, min};
+
+        let mut min_x = usize::MAX;
+        let mut max_x = 0;
+        let mut min_y = usize::MAX;
+        let mut max_y = 0;
+        let mut any = false;
+
         for Pixel(coord, color) in pixels {
-            self.set_pixel(
-                coord.x as u16,
-                coord.y as u16,
-                RawU16::from(color).into_inner(),
-            )?;
+            if coord.x >= 0 && coord.y >= 0 {
+                let x = coord.x as usize;
+                let y = coord.y as usize;
+
+                if x < WIDTH && y < HEIGHT {
+                    self.buffer[y * WIDTH + x] = RawU16::from(color).into_inner();
+
+                    min_x = min(min_x, x);
+                    max_x = max(max_x, x);
+                    min_y = min(min_y, y);
+                    max_y = max(max_y, y);
+                    any = true;
+                }
+            }
         }
 
-        self.mark_tiles_dirty(self.bounding_box());
+        if any {
+            let rect = Rectangle::new(
+                Point::new(min_x as i32, min_y as i32),
+                Size::new((max_x - min_x + 1) as u32, (max_y - min_y + 1) as u32),
+            );
+            self.mark_tiles_dirty(rect);
+        }
 
         Ok(())
     }
