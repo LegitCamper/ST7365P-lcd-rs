@@ -23,7 +23,7 @@ async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let mut config = spi::Config::default();
-    config.frequency = 16_000_000;
+    config.frequency = 32_000_000;
     let spi1 = spi::Spi::new(
         p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.DMA_CH0, p.DMA_CH1, config,
     );
@@ -50,10 +50,15 @@ async fn main(_spawner: Spawner) {
 
     let bmp: Bmp<Rgb565> =
         Bmp::from_slice(include_bytes!("../../../assets/ferriseyes.bmp")).unwrap();
-    let image = Image::new(&bmp, Point::new(0, 0));
+    let y_offset = bmp.size().height as i32 / 4;
+    let image = Image::new(&bmp, Point::new(0, y_offset));
 
     image.draw(&mut framebuffer).unwrap();
-    framebuffer.partial_draw(&mut display).await.unwrap();
+
+    framebuffer
+        .partial_draw_batched(&mut display)
+        .await
+        .unwrap();
 
     loop {}
 }

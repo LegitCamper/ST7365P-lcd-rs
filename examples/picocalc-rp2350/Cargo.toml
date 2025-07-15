@@ -18,13 +18,9 @@ embassy-rp = { version = "0.4.0", features = [
   "binary-info",
 ] }
 embassy-futures = "0.1.1"
-embassy-time = "0.4.0"
+embassy-time = { version = "0.4.0", features = ["defmt"] }
 embassy-embedded-hal = "0.3.0"
 embassy-sync = { version = "0.7" }
-trouble-host = { version = "0.1", features = [
-  "derive",
-  "scan",
-], optional = true }
 
 embedded-hal-bus = { version = "0.3.0", features = ["async"] }
 embedded-hal = "0.2.7"
@@ -34,7 +30,7 @@ cortex-m-rt = "0.7.5"
 panic-probe = "0.3"
 portable-atomic = { version = "1.11", features = ["critical-section"] }
 
-defmt = { version = "0.3", optional = true }
+defmt = { version = "0.3" }
 defmt-rtt = "0.4.2"
 
 embedded-graphics = { version = "0.8.1" }
