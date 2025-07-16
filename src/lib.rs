@@ -474,7 +474,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
         meta_tiles
     }
 
-    /// Sends only dirty tiles (16x16px) individually to the display
+    /// Sends only dirty tiles (16x16px) in batches to the display
     pub async fn partial_draw_batched<SPI, DC, RST, DELAY>(
         &mut self,
         display: &mut ST7365P<SPI, DC, RST, DELAY>,
