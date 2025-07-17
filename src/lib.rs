@@ -165,7 +165,7 @@ where
         &mut self,
         words: impl IntoIterator<Item = &'a u16>,
     ) -> Result<(), ()> {
-        let mut buffer = [0; 32];
+        let mut buffer = [0_u8; 2048];
         let mut index = 0;
         for word in words {
             let as_bytes = word.to_be_bytes();
