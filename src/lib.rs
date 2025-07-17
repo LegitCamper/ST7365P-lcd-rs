@@ -608,36 +608,32 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
-        use core::cmp::{max, min};
-
-        let mut min_x = usize::MAX;
-        let mut max_x = 0;
-        let mut min_y = usize::MAX;
-        let mut max_y = 0;
-        let mut any = false;
+        let mut dirty_rect: Option<Rectangle> = None;
 
         for Pixel(coord, color) in pixels {
             if coord.x >= 0 && coord.y >= 0 {
-                let x = coord.x as usize;
-                let y = coord.y as usize;
+                let x = coord.x as i32;
+                let y = coord.y as i32;
 
-                if x < WIDTH && y < HEIGHT {
-                    self.buffer[y * WIDTH + x] = RawU16::from(color).into_inner();
+                if (x as usize) < WIDTH && (y as usize) < HEIGHT {
+                    self.buffer[(y as usize) * WIDTH + (x as usize)] =
+                        RawU16::from(color).into_inner();
 
-                    min_x = min(min_x, x);
-                    max_x = max(max_x, x);
-                    min_y = min(min_y, y);
-                    max_y = max(max_y, y);
-                    any = true;
+                    if let Some(ref mut rect) = dirty_rect {
+                        rect.top_left.x = rect.top_left.x.min(x);
+                        rect.top_left.y = rect.top_left.y.min(y);
+                        let max_x = (rect.top_left.x + rect.size.width as i32 - 1).max(x);
+                        let max_y = (rect.top_left.y + rect.size.height as i32 - 1).max(y);
+                        rect.size.width = (max_x - rect.top_left.x + 1) as u32;
+                        rect.size.height = (max_y - rect.top_left.y + 1) as u32;
+                    } else {
+                        dirty_rect = Some(Rectangle::new(Point::new(x, y), Size::new(1, 1)));
+                    }
                 }
             }
         }
 
-        if any {
-            let rect = Rectangle::new(
-                Point::new(min_x as i32, min_y as i32),
-                Size::new((max_x - min_x + 1) as u32, (max_y - min_y + 1) as u32),
-            );
+        if let Some(rect) = dirty_rect {
             self.mark_tiles_dirty(rect);
         }
 
@@ -682,6 +678,13 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
         }
 
         Ok(())
+    }
+
+    fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
+        self.fill_contiguous(
+            area,
+            core::iter::repeat(color).take((self.size().width * self.size().height) as usize),
+        )
     }
 
     fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
