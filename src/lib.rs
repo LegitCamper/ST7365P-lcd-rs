@@ -678,7 +678,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
                 }
             }
 
-            self.mark_tiles_dirty(drawable_area);
+            self.mark_tiles_dirty(*area);
         }
 
         Ok(())
