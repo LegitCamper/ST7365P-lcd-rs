@@ -18,7 +18,9 @@ pub enum Instruction {
     RAMWR = 0x2C,
     RAMRD = 0x2E,
     PTLAR = 0x30,
+    VSCRDEF = 0x33,
     TEON = 0x35,
+    VSCSAD = 0x37,
     COLMOD = 0x3A,
     MADCTL = 0x36,
     FRMCTR1 = 0xB1,
@@ -37,5 +39,5 @@ pub enum Instruction {
     PGC = 0xE0,
     NGC = 0xE1,
     DOCA = 0xE8,
-    CSCON = 0xF0
+    CSCON = 0xF0,
 }
