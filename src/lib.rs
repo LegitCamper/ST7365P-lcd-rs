@@ -306,15 +306,12 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
     /// # Panics
     /// Panics if `SIZE != WIDTH * HEIGHT`. This contract is not enforced
     /// by the Rust compiler on stable and must be upheld by the caller.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         assert!(WIDTH > 0, "Framebuffer WIDTH must be > 0");
         assert!(HEIGHT > 0, "Framebuffer HEIGHT must be > 0");
-        assert_eq!(
-            SIZE,
-            WIDTH * HEIGHT,
-            "Framebuffer size mismatch: SIZE must equal WIDTH * HEIGHT ({} * {})",
-            WIDTH,
-            HEIGHT
+        assert!(
+            SIZE == WIDTH * HEIGHT,
+            "Framebuffer size mismatch: SIZE must equal WIDTH * HEIGHT",
         );
         Self {
             buffer: [0_u16; SIZE],
