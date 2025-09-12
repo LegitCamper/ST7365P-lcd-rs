@@ -259,7 +259,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
                 .take((self.size().width * self.size().height) as usize),
         )?;
 
-        self.dirty_tiles.fill(false);
+        self.dirty_tiles.fill(true);
         Ok(())
     }
 }
