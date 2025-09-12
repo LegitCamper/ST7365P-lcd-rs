@@ -195,6 +195,32 @@ where
         Ok(())
     }
 
+    pub async fn set_vertical_scroll_definition(
+        &mut self,
+        tfa: u16,
+        vsa: u16,
+        bsa: u16,
+    ) -> Result<(), ()> {
+        let params = [
+            (tfa >> 8) as u8,
+            (tfa & 0xFF) as u8,
+            (vsa >> 8) as u8,
+            (vsa & 0xFF) as u8,
+            (bsa >> 8) as u8,
+            (bsa & 0xFF) as u8,
+        ];
+        self.write_command(Instruction::VSCRDEF, &params).await?;
+
+        Ok(())
+    }
+
+    pub async fn set_vertical_scroll_start_address(&mut self, vsp: u16) -> Result<(), ()> {
+        let params = [(vsp >> 8) as u8, (vsp & 0xFF) as u8];
+        self.write_command(Instruction::VSCSAD, &params).await?;
+
+        Ok(())
+    }
+
     pub async fn set_orientation(&mut self, orientation: &Orientation) -> Result<(), ()> {
         if self.rgb {
             self.write_command(Instruction::MADCTL, &[*orientation as u8])
