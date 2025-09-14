@@ -10,13 +10,14 @@ use embassy_rp::{
     spi,
 };
 use embassy_time::Delay;
-use embedded_graphics::{image::Image, pixelcolor::Rgb565, prelude::*, Drawable};
+use embedded_graphics::{Drawable, image::Image, pixelcolor::Rgb565, prelude::*};
 use embedded_hal_bus::spi::ExclusiveDevice;
-use st7365p_lcd::{FrameBuffer, ST7365P};
+use st7365p_lcd::{BasicFrameBuffer, FrameBuffer, ST7365P};
 use tinybmp::Bmp;
 
 const SCREEN_WIDTH: usize = 320;
 const SCREEN_HEIGHT: usize = 320;
+type FB = BasicFrameBuffer<SCREEN_WIDTH, SCREEN_HEIGHT, { SCREEN_WIDTH * SCREEN_HEIGHT }>;
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -37,11 +38,7 @@ async fn main(_spawner: Spawner) {
         true,
         Delay,
     );
-    let mut framebuffer: FrameBuffer<
-        SCREEN_WIDTH,
-        SCREEN_HEIGHT,
-        { SCREEN_WIDTH * SCREEN_HEIGHT },
-    > = FrameBuffer::new();
+    let mut framebuffer: FB = BasicFrameBuffer::new();
 
     display.init().await.unwrap();
     display.set_custom_orientation(0x40).await.unwrap();

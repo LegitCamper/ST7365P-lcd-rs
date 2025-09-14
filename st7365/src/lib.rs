@@ -1,19 +1,15 @@
 #![no_std]
+#![allow(async_fn_in_trait)]
 
 //! This crate provides a ST7365P driver to connect to TFT displays.
 
 pub mod instruction;
-use crate::{
-    fb::{MAX_META_TILES, TILE_SIZE},
-    instruction::Instruction,
-};
+use crate::instruction::Instruction;
 mod fb;
-pub use fb::FrameBuffer;
+pub use fb::{BasicFrameBuffer, FrameBuffer};
 
-use embedded_graphics_core::geometry::OriginDimensions;
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
-use heapless::Vec;
 
 const MAX_SCREEN_WIDTH: usize = 320;
 const MAX_SCREEN_HEIGHT: usize = 480;
@@ -314,143 +310,5 @@ where
     pub async fn adjust_gamma(&mut self, pos: &[u8; 16], neg: &[u8; 16]) -> Result<(), ()> {
         self.write_command(Instruction::PGC, pos).await?;
         self.write_command(Instruction::NGC, neg).await
-    }
-
-    /// Sends the entire framebuffer to the display
-    pub async fn draw<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize>(
-        &mut self,
-        fb: &mut FrameBuffer<WIDTH, HEIGHT, SIZE>,
-    ) -> Result<(), ()> {
-        self.set_pixels_buffered(
-            0,
-            0,
-            fb.size().width as u16 - 1,
-            fb.size().height as u16 - 1,
-            &fb.buffer,
-        )
-        .await?;
-
-        fb.dirty_tiles.fill(false);
-
-        Ok(())
-    }
-
-    /// Sends only dirty tiles (16x16px) individually to the display without batching
-    pub async fn partial_draw<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize>(
-        &mut self,
-        fb: &mut FrameBuffer<WIDTH, HEIGHT, SIZE>,
-    ) -> Result<(), ()> {
-        if fb.dirty_tiles.any() {
-            let tiles_x = (WIDTH + TILE_SIZE - 1) / TILE_SIZE;
-            let tiles_y = (HEIGHT + TILE_SIZE - 1) / TILE_SIZE;
-
-            let mut tile_buffer = [0u16; TILE_SIZE * TILE_SIZE];
-
-            for ty in 0..tiles_y {
-                for tx in 0..tiles_x {
-                    if !fb.dirty_tiles[ty * tiles_x + tx] {
-                        continue;
-                    }
-
-                    let x = tx * TILE_SIZE;
-                    let y = ty * TILE_SIZE;
-
-                    // Copy pixels for the tile into tile_buffer
-                    for row in 0..TILE_SIZE {
-                        for col in 0..TILE_SIZE {
-                            let actual_x = x + col;
-                            let actual_y = y + row;
-
-                            if actual_x < WIDTH && actual_y < HEIGHT {
-                                let idx = actual_y * WIDTH + actual_x;
-                                tile_buffer[row * TILE_SIZE + col] = fb.buffer[idx];
-                            } else {
-                                // Out of bounds, fill with zero (or background)
-                                tile_buffer[row * TILE_SIZE + col] = 0;
-                            }
-                        }
-                    }
-
-                    // Send the tile's pixel data to the display
-                    self.set_pixels_buffered(
-                        x as u16,
-                        y as u16,
-                        (x + TILE_SIZE - 1).min(WIDTH - 1) as u16,
-                        (y + TILE_SIZE - 1).min(HEIGHT - 1) as u16,
-                        &tile_buffer,
-                    )
-                    .await?;
-
-                    // Mark tile as clean
-                    fb.dirty_tiles.set(ty * tiles_x + tx, false);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Sends only dirty tiles (16x16px) in batches to the display
-    pub async fn partial_draw_batched<
-        const WIDTH: usize,
-        const HEIGHT: usize,
-        const SIZE: usize,
-    >(
-        &mut self,
-        fb: &mut FrameBuffer<WIDTH, HEIGHT, SIZE>,
-    ) -> Result<(), ()> {
-        if fb.dirty_tiles.any() {
-            let tiles_x = (WIDTH + TILE_SIZE - 1) / TILE_SIZE;
-            let tiles_y = (HEIGHT + TILE_SIZE - 1) / TILE_SIZE;
-
-            let meta_tiles = fb.find_meta_tiles(tiles_x, tiles_y);
-
-            // buffer for copying meta tiles before sending to display
-            let mut pixel_buffer: Vec<u16, { MAX_META_TILES * TILE_SIZE * TILE_SIZE }> = Vec::new();
-
-            for rect in meta_tiles {
-                let rect_width = rect.size.width as usize;
-                let rect_height = rect.size.height as usize;
-                let rect_x = rect.top_left.x as usize;
-                let rect_y = rect.top_left.y as usize;
-
-                pixel_buffer.clear();
-
-                for row in 0..rect_height {
-                    let y = rect_y + row;
-                    let start = y * WIDTH + rect_x;
-                    let end = start + rect_width;
-
-                    // Safe: we guarantee buffer will not exceed MAX_META_TILE_PIXELS
-                    pixel_buffer
-                        .extend_from_slice(&fb.buffer[start..end])
-                        .unwrap();
-                }
-
-                self.set_pixels_buffered(
-                    rect_x as u16,
-                    rect_y as u16,
-                    (rect_x + rect_width - 1) as u16,
-                    (rect_y + rect_height - 1) as u16,
-                    &pixel_buffer,
-                )
-                .await?;
-
-                // walk the meta-tile and set as clean
-                let start_tx = rect_x / TILE_SIZE;
-                let start_ty = rect_y / TILE_SIZE;
-                let end_tx = (rect_x + rect_width - 1) / TILE_SIZE;
-                let end_ty = (rect_y + rect_height - 1) / TILE_SIZE;
-
-                for ty in start_ty..=end_ty {
-                    for tx in start_tx..=end_tx {
-                        let tile_idx = ty * tiles_x + tx;
-                        fb.dirty_tiles.set(tile_idx, false);
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 }

@@ -17,9 +17,9 @@ embassy-rp = { version = "0.4.0", features = [
   "time-driver",
   "binary-info",
 ] }
-embassy-futures = "0.1.1"
+embassy-futures = "0.1.2"
 embassy-time = { version = "0.4.0", features = ["defmt"] }
-embassy-embedded-hal = "0.3.0"
+embassy-embedded-hal = "0.3.2"
 embassy-sync = { version = "0.7" }
 
 embedded-hal-bus = { version = "0.3.0", features = ["async"] }
@@ -35,5 +35,5 @@ defmt-rtt = "0.4.2"
 
 embedded-graphics = { version = "0.8.1" }
 embedded-sdmmc = { git = "https://github.com/Be-ing/embedded-sdmmc-rs", branch = "bisync", default-features = false }
-st7365p-lcd = { path = "../../" }
+st7365p-lcd = { path = "../../st7365" }
 tinybmp = "0.6.0"

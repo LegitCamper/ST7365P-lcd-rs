@@ -4,6 +4,6 @@ This is a Rust library for displays using the ST7365P driver with embedded_graph
 
 Two versions:
 - Synchrouous (which is in master branch)
-- Asyncrounous `branch = "async"`
+- Asynchronous `branch = "async"`
 
 ![picocalc-example](https://github.com/LegitCamper/ST7365P-lcd-rs/blob/master/assets/picocalc-example.jpg)
