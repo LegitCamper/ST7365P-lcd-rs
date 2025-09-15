@@ -1,42 +1,7 @@
-use bitvec::{bitarr, order::Lsb0, BitArr};
+use bitvec::{BitArr, bitarr, order::Lsb0};
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
 use heapless::Vec;
-
-// Framebuffer allowing asynchronous updates to display
-//
-// BasicFrambeBuffer provided for simple usecases
-//
-// Feel free to implement your own for platform specific synchronization primitives
-#[allow(dead_code)]
-pub trait FrameBuffer {
-    /// returns WxH
-    fn mark_tiles_dirty(&mut self, rect: Rectangle);
-    /// walk the dirty tiles and mark groups of tiles(meta-tiles) for batched updates
-    fn find_meta_tiles(&mut self, tiles_x: usize, tiles_y: usize) -> MetaTileVec;
-    fn set_pixel(&mut self, x: u16, y: u16, color: u16) -> Result<(), ()>;
-    fn set_pixels_buffered<P: IntoIterator<Item = u16>>(
-        &mut self,
-        sx: u16,
-        sy: u16,
-        ex: u16,
-        ey: u16,
-        colors: P,
-    ) -> Result<(), ()>;
-
-    async fn draw<SPI: SpiDevice, DC: OutputPin, RST: OutputPin, DELAY: DelayNs>(
-        &mut self,
-        display: &mut ST7365P<SPI, DC, RST, DELAY>,
-    ) -> Result<(), ()>;
-    async fn partial_draw<SPI: SpiDevice, DC: OutputPin, RST: OutputPin, DELAY: DelayNs>(
-        &mut self,
-        display: &mut ST7365P<SPI, DC, RST, DELAY>,
-    ) -> Result<(), ()>;
-    async fn partial_draw_batched<SPI: SpiDevice, DC: OutputPin, RST: OutputPin, DELAY: DelayNs>(
-        &mut self,
-        display: &mut ST7365P<SPI, DC, RST, DELAY>,
-    ) -> Result<(), ()>;
-}
 
 pub(crate) const TILE_SIZE: usize = 16; // 16x16 tile
 pub(crate) const TILE_COUNT: usize =
@@ -46,17 +11,23 @@ pub(crate) const TILE_COUNT: usize =
 pub(crate) const MAX_META_TILES: usize = MAX_SCREEN_WIDTH / TILE_SIZE; // max number of meta tiles in buffer
 type MetaTileVec = Vec<Rectangle, { TILE_COUNT / MAX_META_TILES }>;
 
+/// Simple macro to allow quick initialization without the comberson SIZE const
+#[macro_export]
+macro_rules! framebuffer {
+    ($w:expr, $h:expr) => {
+        FrameBuffer::<$w, $h, { $w * $h }>::new()
+    };
+}
+
 /// provides a synchronous abstraction above the display transport
-/// for embedded-graphics to write to, ensure you periodically push the framebuffer
+/// for embedded-graphics to write to, ensure you periodically flush the framebuffer
 #[allow(dead_code)]
-pub struct BasicFrameBuffer<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> {
+pub struct FrameBuffer<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> {
     pub(crate) buffer: [u16; SIZE],
     pub(crate) dirty_tiles: BitArr!(for TILE_COUNT, in usize, Lsb0),
 }
 
-impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize>
-    BasicFrameBuffer<WIDTH, HEIGHT, SIZE>
-{
+impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WIDTH, HEIGHT, SIZE> {
     /// Constructs a new framebuffer.
     ///
     /// # Panics
@@ -75,11 +46,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize>
             dirty_tiles: bitarr!(usize, Lsb0; 0;TILE_COUNT),
         }
     }
-}
 
-impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer
-    for BasicFrameBuffer<WIDTH, HEIGHT, SIZE>
-{
     fn mark_tiles_dirty(&mut self, rect: Rectangle) {
         let tiles_x = (WIDTH + TILE_SIZE - 1) / TILE_SIZE;
         let start_tx = (rect.top_left.x as usize) / TILE_SIZE;
@@ -109,10 +76,10 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer
         ey: u16,
         colors: P,
     ) -> Result<(), ()> {
-        if sx >= self.size().width as u16 - 1
-            || ex >= self.size().width as u16 - 1
-            || sy >= self.size().height as u16 - 1
-            || ey >= self.size().height as u16 - 1
+        if sx >= self.size().width as u16
+            || ex >= self.size().width as u16
+            || sy >= self.size().height as u16
+            || ey >= self.size().height as u16
         {
             return Err(()); // Bounds check
         }
@@ -189,7 +156,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer
     }
 
     /// Sends the entire framebuffer to the display
-    async fn draw<SPI, DC, RST, DELAY: DelayNs>(
+    pub async fn draw<SPI, DC, RST, DELAY: DelayNs>(
         &mut self,
         display: &mut ST7365P<SPI, DC, RST, DELAY>,
     ) -> Result<(), ()>
@@ -214,7 +181,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer
     }
 
     /// Sends only dirty tiles (16x16px) individually to the display without batching
-    async fn partial_draw<SPI, DC, RST, DELAY: DelayNs>(
+    pub async fn partial_draw<SPI, DC, RST, DELAY: DelayNs>(
         &mut self,
         display: &mut ST7365P<SPI, DC, RST, DELAY>,
     ) -> Result<(), ()>
@@ -275,7 +242,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer
     }
 
     /// Sends only dirty tiles (16x16px) in batches to the display
-    async fn partial_draw_batched<SPI, DC, RST, DELAY>(
+    pub async fn partial_draw_batched<SPI, DC, RST, DELAY>(
         &mut self,
         display: &mut ST7365P<SPI, DC, RST, DELAY>,
     ) -> Result<(), ()>
@@ -350,8 +317,8 @@ use crate::{MAX_SCREEN_HEIGHT, MAX_SCREEN_WIDTH, ST7365P};
 use self::embedded_graphics_core::{
     draw_target::DrawTarget,
     pixelcolor::{
-        raw::{RawData, RawU16},
         Rgb565,
+        raw::{RawData, RawU16},
     },
     prelude::*,
     primitives::Rectangle,
@@ -359,7 +326,7 @@ use self::embedded_graphics_core::{
 
 #[cfg(feature = "graphics")]
 impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
-    for BasicFrameBuffer<WIDTH, HEIGHT, SIZE>
+    for FrameBuffer<WIDTH, HEIGHT, SIZE>
 {
     type Error = ();
     type Color = Rgb565;
@@ -464,7 +431,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
 
 #[cfg(feature = "graphics")]
 impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> OriginDimensions
-    for BasicFrameBuffer<WIDTH, HEIGHT, SIZE>
+    for FrameBuffer<WIDTH, HEIGHT, SIZE>
 {
     fn size(&self) -> Size {
         Size::new(WIDTH as u32, HEIGHT as u32)

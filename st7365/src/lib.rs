@@ -6,7 +6,7 @@
 pub mod instruction;
 use crate::instruction::Instruction;
 mod fb;
-pub use fb::{BasicFrameBuffer, FrameBuffer};
+pub use fb::FrameBuffer;
 
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
