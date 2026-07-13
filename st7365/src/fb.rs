@@ -344,7 +344,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
 
                 if (x as usize) < WIDTH && (y as usize) < HEIGHT {
                     self.buffer[(y as usize) * WIDTH + (x as usize)] =
-                        RawU16::from(color).into_inner();
+                        RawU16::from(color).into_inner().swap_bytes();
 
                     if let Some(ref mut rect) = dirty_rect {
                         rect.top_left.x = rect.top_left.x.min(x);
@@ -389,7 +389,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
                             self.set_pixel(
                                 p.x as u16,
                                 p.y as u16,
-                                RawU16::from(color).into_inner(),
+                                RawU16::from(color).into_inner().swap_bytes(),
                             )?;
                         } else {
                             break;
@@ -420,7 +420,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
             0,
             self.size().width as u16 - 1,
             self.size().height as u16 - 1,
-            core::iter::repeat(RawU16::from(color).into_inner())
+            core::iter::repeat(RawU16::from(color).into_inner().swap_bytes())
                 .take((self.size().width * self.size().height) as usize),
         )?;
 

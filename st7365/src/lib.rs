@@ -14,6 +14,12 @@ use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
 const MAX_SCREEN_WIDTH: usize = 320;
 const MAX_SCREEN_HEIGHT: usize = 480;
 
+// `write_words_buffered` reinterprets pre-swapped `u16` pixels as raw bytes
+// instead of copying word-by-word through `to_be_bytes`. That's only valid
+// on little-endian targets, where swap_bytes() on write already leaves the
+// in-memory byte order MSB-first as the display expects.
+const _: () = assert!(cfg!(target_endian = "little"));
+
 /// ST7365P driver to connect to TFT displays.
 pub struct ST7365P<SPI, DC, RST, DELAY>
 where
@@ -162,23 +168,14 @@ where
         self.write_data(&value.to_be_bytes()).await
     }
 
-    async fn write_words_buffered<'a>(
-        &mut self,
-        words: impl IntoIterator<Item = &'a u16>,
-    ) -> Result<(), ()> {
-        let mut buffer = [0_u8; 2048];
-        let mut index = 0;
-        for word in words {
-            let as_bytes = word.to_be_bytes();
-            buffer[index] = as_bytes[0];
-            buffer[index + 1] = as_bytes[1];
-            index += 2;
-            if index >= buffer.len() {
-                self.write_data(&buffer).await?;
-                index = 0;
-            }
-        }
-        self.write_data(&buffer[0..index]).await
+    // `words` must already be byte-swapped by the caller (see the
+    // little-endian assertion above); this just reinterprets them as bytes
+    // and issues a single DMA write instead of copying word-by-word.
+    async fn write_words_buffered(&mut self, words: &[u16]) -> Result<(), ()> {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 2)
+        };
+        self.write_data(bytes).await
     }
 
     /// ensure you are only setting the top 3 bits for MADCTL (x,y, and x+y)
@@ -269,10 +266,7 @@ where
         }
         Ok(())
     }
-    pub async fn write_pixels_buffered<'a, P: IntoIterator<Item = &'a u16>>(
-        &mut self,
-        colors: P,
-    ) -> Result<(), ()> {
+    pub async fn write_pixels_buffered(&mut self, colors: &[u16]) -> Result<(), ()> {
         self.write_command(Instruction::RAMWR, &[]).await?;
         self.start_data()?;
         self.write_words_buffered(colors).await
@@ -291,13 +285,13 @@ where
         self.write_pixels(colors).await
     }
 
-    pub async fn set_pixels_buffered<'a, P: IntoIterator<Item = &'a u16>>(
+    pub async fn set_pixels_buffered(
         &mut self,
         sx: u16,
         sy: u16,
         ex: u16,
         ey: u16,
-        colors: P,
+        colors: &[u16],
     ) -> Result<(), ()> {
         self.set_address_window(sx, sy, ex, ey).await?;
         self.write_pixels_buffered(colors).await
