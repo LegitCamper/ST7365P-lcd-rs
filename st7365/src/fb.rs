@@ -1,4 +1,4 @@
-use bitvec::{BitArr, bitarr, order::Lsb0};
+use bitvec::{bitarr, order::Lsb0, BitArr};
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
 use heapless::Vec;
@@ -9,7 +9,6 @@ pub(crate) const TILE_COUNT: usize =
 
 // Group of tiles for batching
 pub(crate) const MAX_META_TILES: usize = MAX_SCREEN_WIDTH / TILE_SIZE; // max number of meta tiles in buffer
-type MetaTileVec = Vec<Rectangle, { TILE_COUNT / MAX_META_TILES }>;
 
 /// Simple macro to allow quick initialization without the comberson SIZE const
 #[macro_export]
@@ -28,15 +27,20 @@ pub struct FrameBuffer<const WIDTH: usize, const HEIGHT: usize, const SIZE: usiz
 }
 
 impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WIDTH, HEIGHT, SIZE> {
+    const TILES_X: usize = WIDTH.div_ceil(TILE_SIZE);
+    const TILES_Y: usize = HEIGHT.div_ceil(TILE_SIZE);
+
     /// Constructs a new framebuffer.
     ///
     /// # Panics
-    /// Panics if `SIZE != WIDTH * HEIGHT`. This contract is not enforced
-    /// by the Rust compiler on stable and must be upheld by the caller.
+    /// Panics if dimensions are zero, exceed `u16::MAX`, require more than
+    /// 600 tiles, or if `SIZE != WIDTH * HEIGHT`.
     #[allow(dead_code)]
     pub const fn new() -> Self {
         assert!(WIDTH > 0, "Framebuffer WIDTH must be > 0");
         assert!(HEIGHT > 0, "Framebuffer HEIGHT must be > 0");
+        assert!(WIDTH <= u16::MAX as usize && HEIGHT <= u16::MAX as usize);
+        assert!(Self::TILES_X * Self::TILES_Y <= TILE_COUNT);
         assert!(
             SIZE == WIDTH * HEIGHT,
             "Framebuffer size mismatch: SIZE must equal WIDTH * HEIGHT",
@@ -48,111 +52,24 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
     }
 
     fn mark_tiles_dirty(&mut self, rect: Rectangle) {
-        let tiles_x = (WIDTH + TILE_SIZE - 1) / TILE_SIZE;
         let start_tx = (rect.top_left.x as usize) / TILE_SIZE;
         let end_tx = ((rect.top_left.x + rect.size.width as i32 - 1) as usize) / TILE_SIZE;
         let start_ty = (rect.top_left.y as usize) / TILE_SIZE;
         let end_ty = ((rect.top_left.y + rect.size.height as i32 - 1) as usize) / TILE_SIZE;
 
         for ty in start_ty..=end_ty {
-            for tx in start_tx..=end_tx {
-                let tile_idx = ty * tiles_x + tx;
-                self.dirty_tiles.set(tile_idx, true);
-            }
+            self.dirty_tiles[ty * Self::TILES_X + start_tx..=ty * Self::TILES_X + end_tx]
+                .fill(true);
         }
     }
 
-    fn set_pixel(&mut self, x: u16, y: u16, color: u16) -> Result<(), ()> {
-        self.buffer[(y as usize * WIDTH) + x as usize] = color;
-
-        Ok(())
-    }
-
-    fn set_pixels_buffered<P: IntoIterator<Item = u16>>(
-        &mut self,
-        sx: u16,
-        sy: u16,
-        ex: u16,
-        ey: u16,
-        colors: P,
-    ) -> Result<(), ()> {
-        if sx >= self.size().width as u16
-            || ex >= self.size().width as u16
-            || sy >= self.size().height as u16
-            || ey >= self.size().height as u16
-        {
-            return Err(()); // Bounds check
+    fn set_pixel(&mut self, x: usize, y: usize, color: u16) {
+        let pixel = &mut self.buffer[y * WIDTH + x];
+        if *pixel != color {
+            *pixel = color;
+            self.dirty_tiles
+                .set((y / TILE_SIZE) * Self::TILES_X + x / TILE_SIZE, true);
         }
-
-        let mut color_iter = colors.into_iter();
-
-        for y in sy..=ey {
-            for x in sx..=ex {
-                if let Some(color) = color_iter.next() {
-                    self.buffer[(y as usize * WIDTH) + x as usize] = color;
-                } else {
-                    return Err(()); // Not enough data
-                }
-            }
-        }
-
-        // Optional: check that we consumed *exactly* the right amount
-        if color_iter.next().is_some() {
-            return Err(()); // Too much data
-        }
-
-        Ok(())
-    }
-
-    // walk the dirty tiles and mark groups of tiles(meta-tiles) for batched updates
-    fn find_meta_tiles(&mut self, tiles_x: usize, tiles_y: usize) -> MetaTileVec {
-        let mut meta_tiles: MetaTileVec = Vec::new();
-
-        for ty in 0..tiles_y {
-            let mut tx = 0;
-            while tx < tiles_x {
-                let idx = ty * tiles_x + tx;
-                if !self.dirty_tiles[idx] {
-                    tx += 1;
-                    continue;
-                }
-
-                // Start meta-tile at this tile
-                let mut width_tiles = 1;
-                let height_tiles = 1;
-
-                // Grow horizontally, but keep under MAX_TILES_PER_METATILE
-                while tx + width_tiles < tiles_x
-                    && self.dirty_tiles[ty * tiles_x + tx + width_tiles]
-                    && (width_tiles + height_tiles) <= MAX_META_TILES
-                {
-                    width_tiles += 1;
-                }
-
-                // TODO: for simplicity, skipped vertical growth
-
-                for x_off in 0..width_tiles {
-                    self.dirty_tiles.set(ty * tiles_x + tx + x_off, false);
-                }
-
-                // new meta-tile pos
-                let rect = Rectangle::new(
-                    Point::new((tx * TILE_SIZE) as i32, (ty * TILE_SIZE) as i32),
-                    Size::new(
-                        (width_tiles * TILE_SIZE) as u32,
-                        (height_tiles * TILE_SIZE) as u32,
-                    ),
-                );
-
-                if meta_tiles.push(rect).is_err() {
-                    return meta_tiles;
-                };
-
-                tx += width_tiles;
-            }
-        }
-
-        meta_tiles
     }
 
     /// Sends the entire framebuffer to the display
@@ -191,34 +108,23 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
         RST: OutputPin,
     {
         if self.dirty_tiles.any() {
-            let tiles_x = (WIDTH + TILE_SIZE - 1) / TILE_SIZE;
-            let tiles_y = (HEIGHT + TILE_SIZE - 1) / TILE_SIZE;
-
             let mut tile_buffer = [0u16; TILE_SIZE * TILE_SIZE];
 
-            for ty in 0..tiles_y {
-                for tx in 0..tiles_x {
-                    if !self.dirty_tiles[ty * tiles_x + tx] {
+            for ty in 0..Self::TILES_Y {
+                for tx in 0..Self::TILES_X {
+                    if !self.dirty_tiles[ty * Self::TILES_X + tx] {
                         continue;
                     }
 
                     let x = tx * TILE_SIZE;
                     let y = ty * TILE_SIZE;
+                    let width = TILE_SIZE.min(WIDTH - x);
+                    let height = TILE_SIZE.min(HEIGHT - y);
 
-                    // Copy pixels for the tile into tile_buffer
-                    for row in 0..TILE_SIZE {
-                        for col in 0..TILE_SIZE {
-                            let actual_x = x + col;
-                            let actual_y = y + row;
-
-                            if actual_x < WIDTH && actual_y < HEIGHT {
-                                let idx = actual_y * WIDTH + actual_x;
-                                tile_buffer[row * TILE_SIZE + col] = self.buffer[idx];
-                            } else {
-                                // Out of bounds, fill with zero (or background)
-                                tile_buffer[row * TILE_SIZE + col] = 0;
-                            }
-                        }
+                    for row in 0..height {
+                        let start = (y + row) * WIDTH + x;
+                        tile_buffer[row * width..(row + 1) * width]
+                            .copy_from_slice(&self.buffer[start..start + width]);
                     }
 
                     // Send the tile's pixel data to the display
@@ -226,14 +132,14 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
                         .set_pixels_buffered(
                             x as u16,
                             y as u16,
-                            (x + TILE_SIZE - 1).min(WIDTH - 1) as u16,
-                            (y + TILE_SIZE - 1).min(HEIGHT - 1) as u16,
-                            &tile_buffer,
+                            (x + width - 1) as u16,
+                            (y + height - 1) as u16,
+                            &tile_buffer[..width * height],
                         )
                         .await?;
 
                     // Mark tile as clean
-                    self.dirty_tiles.set(ty * tiles_x + tx, false);
+                    self.dirty_tiles.set(ty * Self::TILES_X + tx, false);
                 }
             }
         }
@@ -252,33 +158,55 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
         RST: OutputPin,
         DELAY: DelayNs,
     {
-        if self.dirty_tiles.any() {
-            let tiles_x = (WIDTH + TILE_SIZE - 1) / TILE_SIZE;
-            let tiles_y = (HEIGHT + TILE_SIZE - 1) / TILE_SIZE;
+        let visible_tiles = &self.dirty_tiles[..Self::TILES_X * Self::TILES_Y];
+        if !visible_tiles.any() {
+            return Ok(());
+        }
+        // ponytail: only all-dirty frames bypass tiling; tune thresholds with hardware timings.
+        if visible_tiles.all() {
+            return self.draw(display).await;
+        }
 
-            let meta_tiles = self.find_meta_tiles(tiles_x, tiles_y);
+        let mut pixel_buffer: Vec<u16, { MAX_META_TILES * TILE_SIZE * TILE_SIZE }> = Vec::new();
 
-            // buffer for copying meta tiles before sending to display
-            let mut pixel_buffer: Vec<u16, { MAX_META_TILES * TILE_SIZE * TILE_SIZE }> = Vec::new();
-
-            for rect in meta_tiles {
-                let rect_width = rect.size.width as usize;
-                let rect_height = rect.size.height as usize;
-                let rect_x = rect.top_left.x as usize;
-                let rect_y = rect.top_left.y as usize;
-
-                pixel_buffer.clear();
-
-                for row in 0..rect_height {
-                    let y = rect_y + row;
-                    let start = y * WIDTH + rect_x;
-                    let end = start + rect_width;
-
-                    // Safe: we guarantee buffer will not exceed MAX_META_TILE_PIXELS
-                    pixel_buffer
-                        .extend_from_slice(&self.buffer[start..end])
-                        .unwrap();
+        for ty in 0..Self::TILES_Y {
+            let mut tx = 0;
+            while tx < Self::TILES_X {
+                let start_tile = ty * Self::TILES_X + tx;
+                if !self.dirty_tiles[start_tile] {
+                    tx += 1;
+                    continue;
                 }
+
+                let row_end = (ty + 1) * Self::TILES_X;
+                let mut width_tiles = if tx == 0 && self.dirty_tiles[start_tile..row_end].all() {
+                    Self::TILES_X
+                } else {
+                    1
+                };
+                while tx + width_tiles < Self::TILES_X
+                    && width_tiles < MAX_META_TILES
+                    && self.dirty_tiles[start_tile + width_tiles]
+                {
+                    width_tiles += 1;
+                }
+
+                let rect_x = tx * TILE_SIZE;
+                let rect_y = ty * TILE_SIZE;
+                let rect_width = (width_tiles * TILE_SIZE).min(WIDTH - rect_x);
+                let rect_height = TILE_SIZE.min(HEIGHT - rect_y);
+                let pixels = if rect_x == 0 && rect_width == WIDTH {
+                    &self.buffer[rect_y * WIDTH..(rect_y + rect_height) * WIDTH]
+                } else {
+                    pixel_buffer.clear();
+                    for row in 0..rect_height {
+                        let start = (rect_y + row) * WIDTH + rect_x;
+                        pixel_buffer
+                            .extend_from_slice(&self.buffer[start..start + rect_width])
+                            .map_err(|_| ())?;
+                    }
+                    pixel_buffer.as_slice()
+                };
 
                 display
                     .set_pixels_buffered(
@@ -286,22 +214,12 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
                         rect_y as u16,
                         (rect_x + rect_width - 1) as u16,
                         (rect_y + rect_height - 1) as u16,
-                        &pixel_buffer,
+                        pixels,
                     )
                     .await?;
 
-                // walk the meta-tile and set as clean
-                let start_tx = rect_x / TILE_SIZE;
-                let start_ty = rect_y / TILE_SIZE;
-                let end_tx = (rect_x + rect_width - 1) / TILE_SIZE;
-                let end_ty = (rect_y + rect_height - 1) / TILE_SIZE;
-
-                for ty in start_ty..=end_ty {
-                    for tx in start_tx..=end_tx {
-                        let tile_idx = ty * tiles_x + tx;
-                        self.dirty_tiles.set(tile_idx, false);
-                    }
-                }
+                self.dirty_tiles[start_tile..start_tile + width_tiles].fill(false);
+                tx += width_tiles;
             }
         }
 
@@ -317,8 +235,8 @@ use crate::{MAX_SCREEN_HEIGHT, MAX_SCREEN_WIDTH, ST7365P};
 use self::embedded_graphics_core::{
     draw_target::DrawTarget,
     pixelcolor::{
-        Rgb565,
         raw::{RawData, RawU16},
+        Rgb565,
     },
     prelude::*,
     primitives::Rectangle,
@@ -335,33 +253,18 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
-        let mut dirty_rect: Option<Rectangle> = None;
-
         for Pixel(coord, color) in pixels {
-            if coord.x >= 0 && coord.y >= 0 {
-                let x = coord.x as i32;
-                let y = coord.y as i32;
-
-                if (x as usize) < WIDTH && (y as usize) < HEIGHT {
-                    self.buffer[(y as usize) * WIDTH + (x as usize)] =
-                        RawU16::from(color).into_inner().swap_bytes();
-
-                    if let Some(ref mut rect) = dirty_rect {
-                        rect.top_left.x = rect.top_left.x.min(x);
-                        rect.top_left.y = rect.top_left.y.min(y);
-                        let max_x = (rect.top_left.x + rect.size.width as i32 - 1).max(x);
-                        let max_y = (rect.top_left.y + rect.size.height as i32 - 1).max(y);
-                        rect.size.width = (max_x - rect.top_left.x + 1) as u32;
-                        rect.size.height = (max_y - rect.top_left.y + 1) as u32;
-                    } else {
-                        dirty_rect = Some(Rectangle::new(Point::new(x, y), Size::new(1, 1)));
-                    }
-                }
+            if coord.x >= 0
+                && coord.y >= 0
+                && (coord.x as usize) < WIDTH
+                && (coord.y as usize) < HEIGHT
+            {
+                self.set_pixel(
+                    coord.x as usize,
+                    coord.y as usize,
+                    RawU16::from(color).into_inner().swap_bytes(),
+                );
             }
-        }
-
-        if let Some(rect) = dirty_rect {
-            self.mark_tiles_dirty(rect);
         }
 
         Ok(())
@@ -373,58 +276,62 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
     {
         let drawable_area = area.intersection(&Rectangle::new(Point::zero(), self.size()));
 
-        if drawable_area.size != Size::zero() {
-            // We assume that `colors` iterator is in row-major order for the original `area`
-            // So we must skip rows/pixels that are clipped
-            let area_width = area.size.width;
-            let area_height = area.size.height;
-            let mut colors = colors.into_iter();
+        if drawable_area.size.width == 0 || drawable_area.size.height == 0 {
+            return Ok(());
+        }
 
-            for y in 0..area_height {
-                for x in 0..area_width {
-                    let p = area.top_left + Point::new(x as i32, y as i32);
+        let start_x = drawable_area.top_left.x as usize;
+        let start_y = drawable_area.top_left.y as usize;
+        let width = drawable_area.size.width as usize;
+        let height = drawable_area.size.height as usize;
+        let skipped_rows = (drawable_area.top_left.y as i64 - area.top_left.y as i64) as usize;
+        let skipped_columns = (drawable_area.top_left.x as i64 - area.top_left.x as i64) as usize;
+        let mut skip = skipped_rows
+            .checked_mul(area.size.width as usize)
+            .and_then(|pixels| pixels.checked_add(skipped_columns))
+            .ok_or(())?;
+        let mut colors = colors.into_iter();
 
-                    if drawable_area.contains(p) {
-                        if let Some(color) = colors.next() {
-                            self.set_pixel(
-                                p.x as u16,
-                                p.y as u16,
-                                RawU16::from(color).into_inner().swap_bytes(),
-                            )?;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        // Still need to consume the color even if not used!
-                        let _ = colors.next();
-                    }
-                }
+        for y in start_y..start_y + height {
+            if skip > 0 && colors.nth(skip - 1).is_none() {
+                return Ok(());
             }
-
-            self.mark_tiles_dirty(*area);
+            for x in start_x..start_x + width {
+                let Some(color) = colors.next() else {
+                    return Ok(());
+                };
+                self.set_pixel(x, y, RawU16::from(color).into_inner().swap_bytes());
+            }
+            skip = area.size.width as usize - width;
         }
 
         Ok(())
     }
 
     fn fill_solid(&mut self, area: &Rectangle, color: Self::Color) -> Result<(), Self::Error> {
-        self.fill_contiguous(
-            area,
-            core::iter::repeat(color).take((self.size().width * self.size().height) as usize),
-        )
+        let drawable_area = area.intersection(&Rectangle::new(Point::zero(), self.size()));
+        if drawable_area.size.width == 0 || drawable_area.size.height == 0 {
+            return Ok(());
+        }
+
+        let start_x = drawable_area.top_left.x as usize;
+        let start_y = drawable_area.top_left.y as usize;
+        let width = drawable_area.size.width as usize;
+        let height = drawable_area.size.height as usize;
+        let color = RawU16::from(color).into_inner().swap_bytes();
+
+        for y in start_y..start_y + height {
+            let start = y * WIDTH + start_x;
+            self.buffer[start..start + width].fill(color);
+        }
+        self.mark_tiles_dirty(drawable_area);
+        Ok(())
     }
 
     fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
-        self.set_pixels_buffered(
-            0,
-            0,
-            self.size().width as u16 - 1,
-            self.size().height as u16 - 1,
-            core::iter::repeat(RawU16::from(color).into_inner().swap_bytes())
-                .take((self.size().width * self.size().height) as usize),
-        )?;
-
-        self.dirty_tiles.fill(true);
+        self.buffer
+            .fill(RawU16::from(color).into_inner().swap_bytes());
+        self.dirty_tiles[..Self::TILES_X * Self::TILES_Y].fill(true);
         Ok(())
     }
 }

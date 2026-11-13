@@ -8,6 +8,9 @@ use crate::instruction::Instruction;
 mod fb;
 pub use fb::FrameBuffer;
 
+#[cfg(all(test, feature = "graphics"))]
+mod tests;
+
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
 
@@ -172,9 +175,8 @@ where
     // little-endian assertion above); this just reinterprets them as bytes
     // and issues a single DMA write instead of copying word-by-word.
     async fn write_words_buffered(&mut self, words: &[u16]) -> Result<(), ()> {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 2)
-        };
+        let bytes =
+            unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 2) };
         self.write_data(bytes).await
     }
 
@@ -239,14 +241,20 @@ where
         ex: u16,
         ey: u16,
     ) -> Result<(), ()> {
-        self.write_command(Instruction::CASET, &[]).await?;
-        self.start_data()?;
-        self.write_word(sx + self.dx).await?;
-        self.write_word(ex + self.dx).await?;
-        self.write_command(Instruction::RASET, &[]).await?;
-        self.start_data()?;
-        self.write_word(sy + self.dy).await?;
-        self.write_word(ey + self.dy).await
+        let start_x = (sx + self.dx).to_be_bytes();
+        let end_x = (ex + self.dx).to_be_bytes();
+        let start_y = (sy + self.dy).to_be_bytes();
+        let end_y = (ey + self.dy).to_be_bytes();
+        self.write_command(
+            Instruction::CASET,
+            &[start_x[0], start_x[1], end_x[0], end_x[1]],
+        )
+        .await?;
+        self.write_command(
+            Instruction::RASET,
+            &[start_y[0], start_y[1], end_y[0], end_y[1]],
+        )
+        .await
     }
 
     /// Sets a pixel color at the given coords.
