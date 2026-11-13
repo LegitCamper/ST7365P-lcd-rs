@@ -8,6 +8,7 @@ use embedded_graphics_core::{
 };
 use embedded_hal::spi::{ErrorKind, ErrorType, Operation};
 use std::{
+    collections::VecDeque,
     future::{pending, Future},
     task::{Context, Poll, Waker},
     vec,
@@ -20,6 +21,10 @@ struct RecordingSpi {
     pointers: Vec<usize>,
     fail_at: Option<usize>,
     pending_at: Option<usize>,
+    scanlines: VecDeque<Result<u16, ErrorKind>>,
+    reads: usize,
+    reads_at_write: Vec<usize>,
+    pending_read_at: Option<usize>,
 }
 
 impl ErrorType for RecordingSpi {
@@ -31,6 +36,23 @@ impl SpiDevice for RecordingSpi {
         &mut self,
         operations: &mut [Operation<'_, u8>],
     ) -> Result<(), Self::Error> {
+        if let [Operation::DelayNs(60), Operation::Write(command), Operation::Read(response), Operation::DelayNs(65)] =
+            operations
+        {
+            assert_eq!(*command, [Instruction::GSCAN as u8]);
+            if self.pending_read_at == Some(self.reads) {
+                pending::<()>().await;
+            }
+            self.reads += 1;
+            response.copy_from_slice(
+                &self
+                    .scanlines
+                    .pop_front()
+                    .expect("missing scan sample")?
+                    .to_be_bytes(),
+            );
+            return Ok(());
+        }
         for operation in operations {
             if self.fail_at == Some(self.writes.len()) {
                 return Err(ErrorKind::Other);
@@ -42,6 +64,7 @@ impl SpiDevice for RecordingSpi {
                 panic!("unexpected SPI operation");
             };
             self.pointers.push(bytes.as_ptr() as usize);
+            self.reads_at_write.push(self.reads);
             self.writes.push(bytes.to_vec());
         }
         Ok(())
@@ -71,7 +94,7 @@ struct Delay {
 
 impl DelayNs for Delay {
     async fn delay_ns(&mut self, nanos: u32) {
-        assert_eq!(nanos, 1);
+        assert!(nanos == 1 || nanos == 50_000);
         self.calls += 1;
     }
 }
@@ -382,6 +405,309 @@ fn failed_dense_flush_keeps_entire_frame_dirty() {
     run(framebuffer.partial_draw_batched(&mut display)).unwrap();
     assert_eq!(display.spi.writes.len(), 6);
     assert_panel_matches(&display.spi.writes, 17, 19, &framebuffer.buffer);
+}
+
+fn scan_config() -> ScanSyncConfig {
+    ScanSyncConfig {
+        frame_scanlines: 80,
+        first_scanline: 7,
+        direction: ScanDirection::TopToBottom,
+        write_budget_lines: 5,
+        max_polls: 20,
+    }
+}
+
+#[test]
+fn sync_draw_checks_each_tile_and_never_uses_dense_fallback() {
+    let mut framebuffer = FrameBuffer::<17, 19, { 17 * 19 }>::new();
+    framebuffer.clear(Rgb565::BLUE).unwrap();
+    let mut display = display();
+    display.spi.scanlines = [10, 22, 23, 15, 23, 24, 25, 26, 27, 30].map(Ok).into();
+    run(framebuffer.draw_sync(&mut display, &scan_config())).unwrap();
+    assert_panel_matches(&display.spi.writes, 17, 19, &framebuffer.buffer);
+    assert_eq!(display.spi.writes.len(), 24);
+    assert_eq!(display.spi.reads_at_write[5], 3);
+    assert_eq!(display.spi.reads_at_write[11], 5);
+    assert_eq!(display.spi.reads_at_write[17], 8);
+    assert_eq!(display.spi.reads_at_write[23], 10);
+    assert!(!framebuffer.dirty_tiles.any());
+    run(framebuffer.draw_sync(&mut display, &scan_config())).unwrap();
+    assert_eq!(display.spi.reads, 10);
+    assert_eq!(display.spi.writes.len(), 24);
+}
+
+#[test]
+fn sync_draw_windows_exclude_scan_and_transfer_deadline_in_every_direction() {
+    for direction in [
+        ScanDirection::TopToBottom,
+        ScanDirection::BottomToTop,
+        ScanDirection::LeftToRight,
+        ScanDirection::RightToLeft,
+    ] {
+        for tile_index in 0..4 {
+            for scanline in 0..80 {
+                let mut framebuffer = FrameBuffer::<17, 19, { 17 * 19 }>::new();
+                framebuffer.dirty_tiles.set(tile_index, true);
+                let mut display = display();
+                display.spi.scanlines = [Ok((scanline + 79) % 80), Ok(scanline)].into();
+                let config = ScanSyncConfig {
+                    direction,
+                    max_polls: 2,
+                    ..scan_config()
+                };
+                let mut occupied = [false; 80];
+                for row in tile_index / 2 * 16..(tile_index / 2 * 16 + 16).min(19) {
+                    for column in tile_index % 2 * 16..(tile_index % 2 * 16 + 16).min(17) {
+                        let physical_line = 7 + match direction {
+                            ScanDirection::TopToBottom => row,
+                            ScanDirection::BottomToTop => 18 - row,
+                            ScanDirection::LeftToRight => column,
+                            ScanDirection::RightToLeft => 16 - column,
+                        };
+                        occupied[physical_line] = true;
+                    }
+                }
+                let safe = (0..=config.write_budget_lines + 1)
+                    .all(|advance| !occupied[((scanline + advance) % 80) as usize]);
+                let result = run(framebuffer.draw_sync(&mut display, &config));
+                assert_eq!(
+                    result,
+                    if safe {
+                        Ok(())
+                    } else {
+                        Err(DrawSyncError::Timeout)
+                    },
+                    "direction={direction:?}, tile={tile_index}, scanline={scanline}"
+                );
+                assert_eq!(display.spi.writes.len(), if safe { 6 } else { 0 });
+                assert_eq!(framebuffer.dirty_tiles[tile_index], !safe);
+            }
+        }
+    }
+}
+
+#[test]
+fn sync_draw_waits_across_frame_wrap_instead_of_racing_scan() {
+    let mut framebuffer = FrameBuffer::<16, 16, 256>::new();
+    framebuffer.clear(Rgb565::RED).unwrap();
+    let config = ScanSyncConfig {
+        first_scanline: 0,
+        ..scan_config()
+    };
+    let mut display = display();
+    display.spi.scanlines = [73, 74, 79, 0, 15, 16].map(Ok).into();
+    run(framebuffer.draw_sync(&mut display, &config)).unwrap();
+    assert_eq!(display.spi.reads_at_write[0], 6);
+}
+
+#[test]
+fn sync_draw_uses_explicit_physical_mapping_with_address_offsets() {
+    let mut framebuffer = FrameBuffer::<16, 16, 256>::new();
+    framebuffer.clear(Rgb565::RED).unwrap();
+    let config = ScanSyncConfig {
+        first_scanline: 64,
+        ..scan_config()
+    };
+    let mut display = display();
+    display.set_offset(2, 3);
+    display.spi.scanlines = [78, 79, 0].map(Ok).into();
+    run(framebuffer.draw_sync(&mut display, &config)).unwrap();
+    assert_eq!(display.spi.reads_at_write[0], 3);
+    assert_eq!(display.spi.writes[1], [0, 2, 0, 17]);
+    assert_eq!(display.spi.writes[3], [0, 3, 0, 18]);
+}
+
+#[test]
+fn sync_draw_uses_one_poll_budget_for_entire_flush() {
+    let mut framebuffer = FrameBuffer::<32, 16, 512>::new();
+    framebuffer.clear(Rgb565::RED).unwrap();
+    let config = ScanSyncConfig {
+        max_polls: 4,
+        ..scan_config()
+    };
+    let mut display = display();
+    display.spi.scanlines = [23, 24, 10, 11].map(Ok).into();
+    assert_eq!(
+        run(framebuffer.draw_sync(&mut display, &config)),
+        Err(DrawSyncError::Timeout)
+    );
+    assert_eq!(display.spi.reads, 4);
+    assert_eq!(display.spi.writes.len(), 6);
+    assert!(!framebuffer.dirty_tiles[0]);
+    assert!(framebuffer.dirty_tiles[1]);
+    display.spi.scanlines = [Ok(23), Ok(24)].into();
+    run(framebuffer.draw_sync(&mut display, &config)).unwrap();
+    assert_eq!(display.spi.writes.len(), 12);
+    assert_panel_matches(&display.spi.writes, 32, 16, &framebuffer.buffer);
+}
+
+#[test]
+fn sync_draw_rejects_stuck_invalid_and_failed_reads_without_writing() {
+    for (samples, expected) in [
+        (vec![Ok(0); 4], DrawSyncError::Timeout),
+        (vec![Ok(30); 4], DrawSyncError::Timeout),
+        (vec![Ok(10), Ok(11), Ok(12), Ok(13)], DrawSyncError::Timeout),
+        (vec![Ok(80)], DrawSyncError::InvalidScanline(80)),
+        (vec![Ok(u16::MAX)], DrawSyncError::InvalidScanline(u16::MAX)),
+        (vec![Err(ErrorKind::Other)], DrawSyncError::Interface),
+        (
+            vec![Ok(23), Err(ErrorKind::Other)],
+            DrawSyncError::Interface,
+        ),
+    ] {
+        let mut framebuffer = FrameBuffer::<16, 16, 256>::new();
+        framebuffer.clear(Rgb565::RED).unwrap();
+        let mut display = display();
+        display.spi.scanlines = samples.into();
+        let config = ScanSyncConfig {
+            max_polls: 4,
+            ..scan_config()
+        };
+        assert_eq!(
+            run(framebuffer.draw_sync(&mut display, &config)),
+            Err(expected)
+        );
+        assert!(display.spi.writes.is_empty());
+        assert!(framebuffer.dirty_tiles[0]);
+    }
+}
+
+#[test]
+fn sync_draw_read_failure_after_progress_preserves_only_unfinished_tiles() {
+    for (sample, error) in [
+        (Err(ErrorKind::Other), DrawSyncError::Interface),
+        (Ok(80), DrawSyncError::InvalidScanline(80)),
+    ] {
+        let mut framebuffer = FrameBuffer::<32, 16, 512>::new();
+        framebuffer.clear(Rgb565::RED).unwrap();
+        let mut display = display();
+        display.spi.scanlines = [Ok(23), Ok(24), sample].into();
+        assert_eq!(
+            run(framebuffer.draw_sync(&mut display, &scan_config())),
+            Err(error)
+        );
+        assert!(!framebuffer.dirty_tiles[0]);
+        assert!(framebuffer.dirty_tiles[1]);
+        assert_eq!(display.spi.writes.len(), 6);
+    }
+}
+
+#[test]
+fn sync_draw_validates_configuration_and_poll_budget_before_io() {
+    for config in [
+        ScanSyncConfig {
+            frame_scanlines: 0,
+            ..scan_config()
+        },
+        ScanSyncConfig {
+            first_scanline: 65,
+            ..scan_config()
+        },
+        ScanSyncConfig {
+            write_budget_lines: 0,
+            ..scan_config()
+        },
+        ScanSyncConfig {
+            write_budget_lines: 63,
+            ..scan_config()
+        },
+        ScanSyncConfig {
+            write_budget_lines: u16::MAX,
+            ..scan_config()
+        },
+    ] {
+        let mut framebuffer = FrameBuffer::<16, 16, 256>::new();
+        let mut display = display();
+        run(framebuffer.draw_sync(&mut display, &config)).unwrap();
+        framebuffer.clear(Rgb565::RED).unwrap();
+        assert_eq!(
+            run(framebuffer.draw_sync(&mut display, &config)),
+            Err(DrawSyncError::InvalidConfig)
+        );
+        assert!(display.spi.writes.is_empty());
+        assert_eq!(display.spi.reads, 0);
+    }
+    for max_polls in [0, 1] {
+        let mut framebuffer = FrameBuffer::<16, 16, 256>::new();
+        framebuffer.clear(Rgb565::RED).unwrap();
+        let mut display = display();
+        let config = ScanSyncConfig {
+            max_polls,
+            ..scan_config()
+        };
+        assert_eq!(
+            run(framebuffer.draw_sync(&mut display, &config)),
+            Err(DrawSyncError::Timeout)
+        );
+        assert_eq!(display.spi.reads, 0);
+    }
+    for offsets in [(u16::MAX, 0), (0, u16::MAX)] {
+        let mut framebuffer = FrameBuffer::<16, 16, 256>::new();
+        framebuffer.clear(Rgb565::RED).unwrap();
+        let mut display = display();
+        display.set_offset(offsets.0, offsets.1);
+        assert_eq!(
+            run(framebuffer.draw_sync(&mut display, &scan_config())),
+            Err(DrawSyncError::InvalidConfig)
+        );
+        assert_eq!(display.spi.reads, 0);
+    }
+}
+
+#[test]
+fn sync_draw_write_failures_preserve_unsent_tiles_for_retry() {
+    for fail_at in 0..12 {
+        let mut framebuffer = FrameBuffer::<32, 16, 512>::new();
+        framebuffer.clear(Rgb565::RED).unwrap();
+        let mut display = display();
+        display.spi.scanlines = [23, 24, 25, 26].map(Ok).into();
+        display.spi.fail_at = Some(fail_at);
+        assert_eq!(
+            run(framebuffer.draw_sync(&mut display, &scan_config())),
+            Err(DrawSyncError::Interface)
+        );
+        let remaining = if fail_at < 6 { 2 } else { 1 };
+        assert_eq!(framebuffer.dirty_tiles.count_ones(), remaining);
+        display.spi.fail_at = None;
+        display.spi.writes.clear();
+        display.spi.scanlines = [23, 24, 25, 26].map(Ok).into();
+        run(framebuffer.draw_sync(&mut display, &scan_config())).unwrap();
+        assert_eq!(display.spi.writes.len(), remaining * 6);
+        assert!(!framebuffer.dirty_tiles.any());
+    }
+}
+
+#[test]
+fn sync_draw_cancellation_during_poll_or_write_preserves_unsent_tiles() {
+    for (pending_read_at, pending_at, remaining) in [
+        (Some(1), None, 2),
+        (Some(3), None, 1),
+        (None, Some(5), 2),
+        (None, Some(11), 1),
+    ] {
+        let mut framebuffer = FrameBuffer::<32, 16, 512>::new();
+        framebuffer.clear(Rgb565::RED).unwrap();
+        let mut display = display();
+        display.spi.scanlines = [23, 24, 25, 26].map(Ok).into();
+        display.spi.pending_read_at = pending_read_at;
+        display.spi.pending_at = pending_at;
+        let config = scan_config();
+        {
+            let mut future = std::pin::pin!(framebuffer.draw_sync(&mut display, &config));
+            assert!(future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        assert_eq!(framebuffer.dirty_tiles.count_ones(), remaining);
+        display.spi.pending_read_at = None;
+        display.spi.pending_at = None;
+        display.spi.writes.clear();
+        display.spi.scanlines = [23, 24, 25, 26].map(Ok).into();
+        run(framebuffer.draw_sync(&mut display, &config)).unwrap();
+        assert_eq!(display.spi.writes.len(), remaining * 6);
+        assert!(!framebuffer.dirty_tiles.any());
+    }
 }
 
 #[test]

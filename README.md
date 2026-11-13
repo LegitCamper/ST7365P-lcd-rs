@@ -86,4 +86,83 @@ parameters reduce the number of writes and waits instead.
 Run host regression tests with `cargo test -p st7365p-lcd --lib` (also with
 `--release`). Actual draw times still require measurements on the target hardware.
 
+### Scan-aware partial updates
+
+Choose the flush API according to latency and tearing requirements:
+
+- `draw`: sends the entire framebuffer immediately, without scan synchronization.
+- `partial_draw`: sends dirty 16x16 tiles immediately.
+- `partial_draw_batched`: batches dirty tiles for throughput; all-dirty frames
+  use one full-frame transfer.
+- `draw_sync`: sends only dirty tiles, checking GSCAN separately before each
+  tile. It waits whenever the scan overlaps that tile or would reach it before
+  the configured transfer budget expires. This trades throughput and latency
+  for reduced local tearing; it never silently falls back to unsynchronized
+  drawing, even for an all-dirty frame.
+
+`draw_sync` needs a `ScanSyncConfig` calibrated for your panel and workload.
+There are deliberately no guessed refresh-rate, porch, or orientation defaults.
+`frame_scanlines` is the counter's full period, not the framebuffer height;
+`first_scanline` is the first physical line occupied by this framebuffer,
+including porches and display offsets. `direction` describes physical scanning
+in framebuffer coordinates after rotation. Recalibrate when changing display
+orientation, offsets, refresh settings, SPI speed, or executor load. The mapping
+must be contiguous: wrapped hardware scrolling is not supported.
+
+```rust,ignore
+use st7365p_lcd::{DrawSyncError, ScanDirection, ScanSyncConfig};
+
+let sync = ScanSyncConfig {
+    frame_scanlines: measured_frame_lines,
+    first_scanline: measured_first_visible_line,
+    direction: ScanDirection::TopToBottom, // Use your verified physical direction.
+    write_budget_lines: measured_worst_case_tile_lines + safety_margin_lines,
+    max_polls: 2_000,
+};
+
+// Reads and writes share one read-safe clock throughout draw_sync.
+config.frequency = 6_000_000;
+display.spi_mut().bus_mut().set_config(&config);
+let result = framebuffer.draw_sync(&mut display, &sync).await;
+config.frequency = 32_000_000; // Restore your board's chosen write clock.
+display.spi_mut().bus_mut().set_config(&config);
+
+match result {
+    Ok(()) => {}
+    Err(DrawSyncError::Timeout) => { /* Retry remaining dirty tiles later. */ }
+    Err(error) => return Err(error),
+}
+```
+
+**Timing budget matters.** `write_budget_lines` is a nonzero upper bound on
+elapsed scanline periods from the accepted GSCAN sample until the last pixel
+of a 16x16 RGB565 tile has arrived. Include the remaining read time, address
+commands, SPI transfer, bus contention, async scheduling delays, and margin;
+round up. A tile contains at most 512 pixel bytes. The scheduler reserves one
+additional line before the next scan visit. Wire speed alone is not a sufficient
+budget, and unbounded executor delays cannot be made tear-free by polling.
+
+Each tile requires at least two reads showing counter movement; stuck values
+cannot immediately authorize a write. `max_polls` limits reads across the entire
+flush, not per tile. Polls within a tile wait are spaced by at least 50 us. A HAL
+call that stalls still needs an application-level timeout. Out-of-range counter
+values return `InvalidScanline`; impossible geometry or timing budgets return
+`InvalidConfig`; transport failures return `Interface`. No dirty tiles means no
+SPI activity. Only successfully uploaded tiles become clean, so failures or
+dropped futures preserve unfinished work for retry.
+
+This first version uses fixed 16x16 tiles and leaves SPI configuration alone.
+Keep the entire call at a read-safe clock; switching between every read and write
+is not built in. If an application timeout cancels the future, restore your SPI
+clock after that timeout result as well. Prefer `partial_draw_batched` when
+latency matters more than tearing.
+
+**Not an atomic frame swap.** Writes may occur before or after the scan passes a
+tile, and different tiles may become visible in different refreshes. Large images
+can visibly assemble over multiple frames. Accurate timing can reduce tearing
+within individual tiles, but cannot guarantee a coherent whole-screen image.
+Tests exercise scheduling, all four scan directions, transfer deadlines,
+wraparound, clipped tiles, failure, and cancellation. Hardware timing remains
+unverified.
+
 ![picocalc-example](https://github.com/LegitCamper/ST7365P-lcd-rs/blob/master/assets/picocalc-example.jpg)

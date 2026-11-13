@@ -10,6 +10,58 @@ pub(crate) const TILE_COUNT: usize =
 // Group of tiles for batching
 pub(crate) const MAX_META_TILES: usize = MAX_SCREEN_WIDTH / TILE_SIZE; // max number of meta tiles in buffer
 
+/// Physical scan order expressed in framebuffer coordinates, after rotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanDirection {
+    /// Increasing framebuffer Y.
+    TopToBottom,
+    /// Decreasing framebuffer Y.
+    BottomToTop,
+    /// Increasing framebuffer X.
+    LeftToRight,
+    /// Decreasing framebuffer X.
+    RightToLeft,
+}
+
+/// Measured panel geometry and transfer limits for [`FrameBuffer::draw_sync`].
+///
+/// No timing defaults are assumed. Recalibrate after changing orientation,
+/// offsets, refresh rate, SPI speed, or executor load. The framebuffer must map
+/// to one contiguous physical scan interval; wrapped hardware scrolling is not
+/// supported by this mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanSyncConfig {
+    /// Number of counter values per frame, including sync and porch lines.
+    pub frame_scanlines: u16,
+    /// GSCAN value for the first framebuffer row/column scanned in `direction`.
+    /// Includes panel porches and the framebuffer's display offset.
+    pub first_scanline: u16,
+    /// Physical scan direction, not the pixel upload order.
+    pub direction: ScanDirection,
+    /// Nonzero worst-case duration, in scanline periods, from the accepted
+    /// GSCAN sample to the last pixel of a 16x16 tile. Round up and include read
+    /// latency, address commands, bus contention, executor delays, and margin.
+    /// One additional line is reserved before the scan reaches the tile.
+    pub write_budget_lines: u16,
+    /// Total GSCAN read budget for the entire call, not per tile. Polls within
+    /// each tile wait are spaced by at least 50 us. Not a wall-clock timeout.
+    pub max_polls: u32,
+}
+
+/// Failure during a synchronized partial framebuffer update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawSyncError {
+    /// Geometry is invalid, address offsets overflow, or the transfer budget
+    /// cannot fit outside the largest tile's physical scan interval.
+    InvalidConfig,
+    /// The controller returned a counter outside `0..frame_scanlines`.
+    InvalidScanline(u16),
+    /// The total polling budget was exhausted, including a stuck counter.
+    Timeout,
+    /// A scan read, pixel write, or data/command pin operation failed.
+    Interface,
+}
+
 /// Simple macro to allow quick initialization without the comberson SIZE const
 #[macro_export]
 macro_rules! framebuffer {
@@ -144,6 +196,124 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
             }
         }
 
+        Ok(())
+    }
+
+    /// Flushes dirty tiles only when the physical scan leaves time to finish.
+    ///
+    /// Each tile gets a fresh moving GSCAN sample before writing. A tile is
+    /// eligible before or after its scan interval only if the next visit is
+    /// farther away than `write_budget_lines + 1`. Even an all-dirty framebuffer
+    /// stays tiled; no unsynchronized full-frame fallback is used.
+    ///
+    /// Keep SPI at a read-safe clock (6 MHz or less) for this entire call. The
+    /// driver does not change clocks. Packets contain at most 256 RGB565 pixels.
+    /// Only completed tiles become clean; errors or cancellation leave the
+    /// current and remaining tiles dirty for retry. An unchanged buffer does
+    /// no I/O, even with an invalid configuration.
+    ///
+    /// Tear avoidance depends on accurate physical mapping and a conservative
+    /// transfer budget. Unbounded async scheduling delays cannot be protected
+    /// against. Tiles may appear in different frames: this is not an atomic
+    /// frame swap. Apply an application-level timeout if the HAL can stall.
+    pub async fn draw_sync<SPI, DC, RST, DELAY>(
+        &mut self,
+        display: &mut ST7365P<SPI, DC, RST, DELAY>,
+        config: &ScanSyncConfig,
+    ) -> Result<(), DrawSyncError>
+    where
+        SPI: SpiDevice,
+        DC: OutputPin,
+        RST: OutputPin,
+        DELAY: DelayNs,
+    {
+        if !self.dirty_tiles[..Self::TILES_X * Self::TILES_Y].any() {
+            return Ok(());
+        }
+        let scan_extent = match config.direction {
+            ScanDirection::TopToBottom | ScanDirection::BottomToTop => HEIGHT,
+            ScanDirection::LeftToRight | ScanDirection::RightToLeft => WIDTH,
+        };
+        let frame_lines = usize::from(config.frame_scanlines);
+        let first_line = usize::from(config.first_scanline);
+        let budget = usize::from(config.write_budget_lines);
+        if first_line + scan_extent > frame_lines
+            || budget == 0
+            || budget + TILE_SIZE.min(scan_extent) + 1 >= frame_lines
+            || WIDTH - 1 + usize::from(display.dx) > u16::MAX as usize
+            || HEIGHT - 1 + usize::from(display.dy) > u16::MAX as usize
+        {
+            return Err(DrawSyncError::InvalidConfig);
+        }
+
+        // ponytail: fixed-size tiles at one read-safe clock; batch only with measured timing bounds.
+        let mut tile_buffer = [0u16; TILE_SIZE * TILE_SIZE];
+        let mut polls_left = config.max_polls;
+        for tile_y in 0..Self::TILES_Y {
+            for tile_x in 0..Self::TILES_X {
+                let tile_index = tile_y * Self::TILES_X + tile_x;
+                if !self.dirty_tiles[tile_index] {
+                    continue;
+                }
+                if polls_left < 2 {
+                    return Err(DrawSyncError::Timeout);
+                }
+                let rect_x = tile_x * TILE_SIZE;
+                let rect_y = tile_y * TILE_SIZE;
+                let rect_width = TILE_SIZE.min(WIDTH - rect_x);
+                let rect_height = TILE_SIZE.min(HEIGHT - rect_y);
+                for row in 0..rect_height {
+                    let source = (rect_y + row) * WIDTH + rect_x;
+                    tile_buffer[row * rect_width..(row + 1) * rect_width]
+                        .copy_from_slice(&self.buffer[source..source + rect_width]);
+                }
+                let (scan_start, scan_length) = match config.direction {
+                    ScanDirection::TopToBottom => (rect_y, rect_height),
+                    ScanDirection::BottomToTop => (HEIGHT - rect_y - rect_height, rect_height),
+                    ScanDirection::LeftToRight => (rect_x, rect_width),
+                    ScanDirection::RightToLeft => (WIDTH - rect_x - rect_width, rect_width),
+                };
+                let scan_start = first_line + scan_start;
+                let scan_end = scan_start + scan_length;
+                let mut previous = None;
+                loop {
+                    if polls_left == 0 {
+                        return Err(DrawSyncError::Timeout);
+                    }
+                    if previous.is_some() {
+                        display.delay.delay_us(50).await;
+                    }
+                    let current = display
+                        .read_scanline()
+                        .await
+                        .map_err(|_| DrawSyncError::Interface)?;
+                    polls_left -= 1;
+                    if current >= config.frame_scanlines {
+                        return Err(DrawSyncError::InvalidScanline(current));
+                    }
+                    let current = usize::from(current);
+                    let distance = (scan_start + frame_lines - current) % frame_lines;
+                    if previous.is_some_and(|last| last != current)
+                        && !(scan_start..scan_end).contains(&current)
+                        && distance > budget + 1
+                    {
+                        break;
+                    }
+                    previous = Some(current);
+                }
+                display
+                    .set_pixels_buffered(
+                        rect_x as u16,
+                        rect_y as u16,
+                        (rect_x + rect_width - 1) as u16,
+                        (rect_y + rect_height - 1) as u16,
+                        &tile_buffer[..rect_width * rect_height],
+                    )
+                    .await
+                    .map_err(|_| DrawSyncError::Interface)?;
+                self.dirty_tiles.set(tile_index, false);
+            }
+        }
         Ok(())
     }
 
