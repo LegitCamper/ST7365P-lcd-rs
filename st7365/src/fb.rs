@@ -1,7 +1,69 @@
 use bitvec::{bitarr, order::Lsb0, BitArr};
+use core::ops::Range;
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
-use heapless::Vec;
+
+/// Owned pixel storage used by [`FrameBuffer::new`].
+pub type DefaultPixelStorage<const SIZE: usize> = [u16; SIZE];
+
+/// Pixel access independent of allocation and synchronization.
+///
+/// Words use the driver's buffered wire format: byte-swapped RGB565 on
+/// little-endian targets. Length must remain constant while attached.
+/// The framebuffer supplies in-bounds indices and ranges.
+/// Mutations must go through the framebuffer to maintain dirty tracking.
+/// Atomic storage alone does not make concurrent drawing/flushing supported.
+pub trait PixelStorage {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn read(&self, index: usize) -> u16;
+    fn write(&mut self, index: usize, value: u16);
+
+    fn fill_range(&mut self, range: Range<usize>, value: u16) {
+        for index in range {
+            self.write(index, value);
+        }
+    }
+
+    fn copy_into(&self, start: usize, destination: &mut [u16]) {
+        for (offset, pixel) in destination.iter_mut().enumerate() {
+            *pixel = self.read(start + offset);
+        }
+    }
+
+    /// Optional zero-copy fast path. Concurrently mutable storage must return None.
+    fn as_slice(&self) -> Option<&[u16]> {
+        None
+    }
+}
+
+impl<Storage: AsRef<[u16]> + AsMut<[u16]>> PixelStorage for Storage {
+    fn len(&self) -> usize {
+        self.as_ref().len()
+    }
+
+    fn read(&self, index: usize) -> u16 {
+        self.as_ref()[index]
+    }
+
+    fn write(&mut self, index: usize, value: u16) {
+        self.as_mut()[index] = value;
+    }
+
+    fn fill_range(&mut self, range: Range<usize>, value: u16) {
+        self.as_mut()[range].fill(value);
+    }
+
+    fn copy_into(&self, start: usize, destination: &mut [u16]) {
+        destination.copy_from_slice(&self.as_ref()[start..start + destination.len()]);
+    }
+
+    fn as_slice(&self) -> Option<&[u16]> {
+        Some(self.as_ref())
+    }
+}
 
 pub(crate) const TILE_SIZE: usize = 16; // 16x16 tile
 pub(crate) const TILE_COUNT: usize =
@@ -73,15 +135,17 @@ macro_rules! framebuffer {
 /// provides a synchronous abstraction above the display transport
 /// for embedded-graphics to write to, ensure you periodically flush the framebuffer
 #[allow(dead_code)]
-pub struct FrameBuffer<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> {
-    pub(crate) buffer: [u16; SIZE],
+pub struct FrameBuffer<
+    const WIDTH: usize,
+    const HEIGHT: usize,
+    const SIZE: usize,
+    Storage = DefaultPixelStorage<SIZE>,
+> {
+    pub(crate) buffer: Storage,
     pub(crate) dirty_tiles: BitArr!(for TILE_COUNT, in usize, Lsb0),
 }
 
 impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WIDTH, HEIGHT, SIZE> {
-    const TILES_X: usize = WIDTH.div_ceil(TILE_SIZE);
-    const TILES_Y: usize = HEIGHT.div_ceil(TILE_SIZE);
-
     /// Constructs a new framebuffer.
     ///
     /// # Panics
@@ -89,6 +153,21 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
     /// 600 tiles, or if `SIZE != WIDTH * HEIGHT`.
     #[allow(dead_code)]
     pub const fn new() -> Self {
+        Self::validate_dimensions();
+        Self {
+            buffer: [0_u16; SIZE],
+            dirty_tiles: bitarr!(usize, Lsb0; 0;TILE_COUNT),
+        }
+    }
+}
+
+impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelStorage>
+    FrameBuffer<WIDTH, HEIGHT, SIZE, Storage>
+{
+    const TILES_X: usize = WIDTH.div_ceil(TILE_SIZE);
+    const TILES_Y: usize = HEIGHT.div_ceil(TILE_SIZE);
+
+    const fn validate_dimensions() {
         assert!(WIDTH > 0, "Framebuffer WIDTH must be > 0");
         assert!(HEIGHT > 0, "Framebuffer HEIGHT must be > 0");
         assert!(WIDTH <= u16::MAX as usize && HEIGHT <= u16::MAX as usize);
@@ -97,10 +176,21 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
             SIZE == WIDTH * HEIGHT,
             "Framebuffer size mismatch: SIZE must equal WIDTH * HEIGHT",
         );
-        Self {
-            buffer: [0_u16; SIZE],
+    }
+
+    /// Attaches caller-provided storage, initially marking every visible tile dirty.
+    ///
+    /// # Panics
+    /// Panics for invalid dimensions or a storage length other than SIZE.
+    pub fn with_storage(storage: Storage) -> Self {
+        Self::validate_dimensions();
+        assert!(storage.len() == SIZE, "Framebuffer storage length mismatch");
+        let mut framebuffer = Self {
+            buffer: storage,
             dirty_tiles: bitarr!(usize, Lsb0; 0;TILE_COUNT),
-        }
+        };
+        framebuffer.dirty_tiles[..Self::TILES_X * Self::TILES_Y].fill(true);
+        framebuffer
     }
 
     fn mark_tiles_dirty(&mut self, rect: Rectangle) {
@@ -116,9 +206,9 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
     }
 
     fn set_pixel(&mut self, x: usize, y: usize, color: u16) {
-        let pixel = &mut self.buffer[y * WIDTH + x];
-        if *pixel != color {
-            *pixel = color;
+        let index = y * WIDTH + x;
+        if self.buffer.read(index) != color {
+            self.buffer.write(index, color);
             self.dirty_tiles
                 .set((y / TILE_SIZE) * Self::TILES_X + x / TILE_SIZE, true);
         }
@@ -134,13 +224,17 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
         DC: OutputPin,
         RST: OutputPin,
     {
+        let Some(pixels) = self.buffer.as_slice() else {
+            self.dirty_tiles[..Self::TILES_X * Self::TILES_Y].fill(true);
+            return self.partial_draw(display).await;
+        };
         display
             .set_pixels_buffered(
                 0,
                 0,
                 self.size().width as u16 - 1,
                 self.size().height as u16 - 1,
-                &self.buffer,
+                pixels,
             )
             .await?;
 
@@ -175,8 +269,8 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
 
                     for row in 0..height {
                         let start = (y + row) * WIDTH + x;
-                        tile_buffer[row * width..(row + 1) * width]
-                            .copy_from_slice(&self.buffer[start..start + width]);
+                        self.buffer
+                            .copy_into(start, &mut tile_buffer[row * width..(row + 1) * width]);
                     }
 
                     // Send the tile's pixel data to the display
@@ -264,8 +358,10 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
                 let rect_height = TILE_SIZE.min(HEIGHT - rect_y);
                 for row in 0..rect_height {
                     let source = (rect_y + row) * WIDTH + rect_x;
-                    tile_buffer[row * rect_width..(row + 1) * rect_width]
-                        .copy_from_slice(&self.buffer[source..source + rect_width]);
+                    self.buffer.copy_into(
+                        source,
+                        &mut tile_buffer[row * rect_width..(row + 1) * rect_width],
+                    );
                 }
                 let (scan_start, scan_length) = match config.direction {
                     ScanDirection::TopToBottom => (rect_y, rect_height),
@@ -332,12 +428,11 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
         if !visible_tiles.any() {
             return Ok(());
         }
-        // ponytail: only all-dirty frames bypass tiling; tune thresholds with hardware timings.
-        if visible_tiles.all() {
+        if visible_tiles.count_ones() * 100 >= visible_tiles.len() * 80 {
             return self.draw(display).await;
         }
 
-        let mut pixel_buffer: Vec<u16, { MAX_META_TILES * TILE_SIZE * TILE_SIZE }> = Vec::new();
+        let mut pixel_buffer = [0u16; MAX_META_TILES * TILE_SIZE * TILE_SIZE];
 
         for ty in 0..Self::TILES_Y {
             let mut tx = 0;
@@ -349,7 +444,10 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
                 }
 
                 let row_end = (ty + 1) * Self::TILES_X;
-                let mut width_tiles = if tx == 0 && self.dirty_tiles[start_tile..row_end].all() {
+                let mut width_tiles = if tx == 0
+                    && self.buffer.as_slice().is_some()
+                    && self.dirty_tiles[start_tile..row_end].all()
+                {
                     Self::TILES_X
                 } else {
                     1
@@ -365,17 +463,21 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
                 let rect_y = ty * TILE_SIZE;
                 let rect_width = (width_tiles * TILE_SIZE).min(WIDTH - rect_x);
                 let rect_height = TILE_SIZE.min(HEIGHT - rect_y);
-                let pixels = if rect_x == 0 && rect_width == WIDTH {
-                    &self.buffer[rect_y * WIDTH..(rect_y + rect_height) * WIDTH]
+                let contiguous = self
+                    .buffer
+                    .as_slice()
+                    .filter(|_| rect_x == 0 && rect_width == WIDTH);
+                let pixels = if let Some(buffer) = contiguous {
+                    &buffer[rect_y * WIDTH..(rect_y + rect_height) * WIDTH]
                 } else {
-                    pixel_buffer.clear();
                     for row in 0..rect_height {
                         let start = (rect_y + row) * WIDTH + rect_x;
-                        pixel_buffer
-                            .extend_from_slice(&self.buffer[start..start + rect_width])
-                            .map_err(|_| ())?;
+                        self.buffer.copy_into(
+                            start,
+                            &mut pixel_buffer[row * rect_width..(row + 1) * rect_width],
+                        );
                     }
-                    pixel_buffer.as_slice()
+                    &pixel_buffer[..rect_width * rect_height]
                 };
 
                 display
@@ -413,8 +515,8 @@ use self::embedded_graphics_core::{
 };
 
 #[cfg(feature = "graphics")]
-impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
-    for FrameBuffer<WIDTH, HEIGHT, SIZE>
+impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelStorage> DrawTarget
+    for FrameBuffer<WIDTH, HEIGHT, SIZE, Storage>
 {
     type Error = ();
     type Color = Rgb565;
@@ -492,7 +594,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
 
         for y in start_y..start_y + height {
             let start = y * WIDTH + start_x;
-            self.buffer[start..start + width].fill(color);
+            self.buffer.fill_range(start..start + width, color);
         }
         self.mark_tiles_dirty(drawable_area);
         Ok(())
@@ -500,15 +602,15 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> DrawTarget
 
     fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
         self.buffer
-            .fill(RawU16::from(color).into_inner().swap_bytes());
+            .fill_range(0..SIZE, RawU16::from(color).into_inner().swap_bytes());
         self.dirty_tiles[..Self::TILES_X * Self::TILES_Y].fill(true);
         Ok(())
     }
 }
 
 #[cfg(feature = "graphics")]
-impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> OriginDimensions
-    for FrameBuffer<WIDTH, HEIGHT, SIZE>
+impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelStorage>
+    OriginDimensions for FrameBuffer<WIDTH, HEIGHT, SIZE, Storage>
 {
     fn size(&self) -> Size {
         Size::new(WIDTH as u32, HEIGHT as u32)

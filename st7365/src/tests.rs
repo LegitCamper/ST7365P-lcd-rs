@@ -15,6 +15,147 @@ use std::{
     vec::Vec,
 };
 
+struct AtomicStorage<const SIZE: usize>([core::sync::atomic::AtomicU16; SIZE]);
+
+impl<const SIZE: usize> AtomicStorage<SIZE> {
+    fn new() -> Self {
+        Self(core::array::from_fn(|_| {
+            core::sync::atomic::AtomicU16::new(0)
+        }))
+    }
+}
+
+impl<const SIZE: usize> PixelStorage for AtomicStorage<SIZE> {
+    fn len(&self) -> usize {
+        SIZE
+    }
+
+    fn read(&self, index: usize) -> u16 {
+        self.0[index].load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn write(&mut self, index: usize, value: u16) {
+        self.0[index].store(value, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn storage_backends_share_drawing_and_wire_output() {
+    fn exercise(storage: impl PixelStorage) -> Vec<Vec<u8>> {
+        let mut framebuffer = FrameBuffer::<33, 35, { 33 * 35 }, _>::with_storage(storage);
+        let mut display = display();
+        framebuffer.clear(Rgb565::BLACK).unwrap();
+        run(framebuffer.draw(&mut display)).unwrap();
+        display.spi.writes.clear();
+
+        framebuffer
+            .fill_contiguous(
+                &Rectangle::new(Point::new(-1, 16), Size::new(3, 2)),
+                [Rgb565::WHITE, Rgb565::RED, Rgb565::BLUE, Rgb565::WHITE],
+            )
+            .unwrap();
+        framebuffer
+            .fill_solid(
+                &Rectangle::new(Point::new(32, 34), Size::new(8, 8)),
+                Rgb565::GREEN,
+            )
+            .unwrap();
+        framebuffer
+            .draw_iter([Pixel(Point::new(17, 0), Rgb565::WHITE)])
+            .unwrap();
+        run(framebuffer.partial_draw_batched(&mut display)).unwrap();
+        let mut expected = vec![0; 33 * 35];
+        expected[16 * 33] = 0xf800_u16.swap_bytes();
+        expected[16 * 33 + 1] = 0x001f_u16.swap_bytes();
+        expected[34 * 33 + 32] = 0x07e0_u16.swap_bytes();
+        expected[17] = 0xffff;
+        assert_panel_matches(&display.spi.writes, 33, 35, &expected);
+        let writes = display.spi.writes.len();
+        run(framebuffer.partial_draw_batched(&mut display)).unwrap();
+        assert_eq!(display.spi.writes.len(), writes);
+        display.spi.writes
+    }
+
+    let owned: DefaultPixelStorage<{ 33 * 35 }> = [0; 33 * 35];
+    let expected = exercise(owned);
+    let mut borrowed = [0u16; 33 * 35];
+    assert_eq!(exercise(&mut borrowed[..]), expected);
+    assert_eq!(exercise(AtomicStorage::<{ 33 * 35 }>::new()), expected);
+}
+
+#[test]
+fn custom_storage_full_draw_packs_edges_and_retries_failed_tiles() {
+    let mut framebuffer =
+        FrameBuffer::<17, 19, { 17 * 19 }, _>::with_storage(AtomicStorage::<{ 17 * 19 }>::new());
+    framebuffer.clear(Rgb565::BLUE).unwrap();
+    let mut display = display();
+    display.spi.fail_at = Some(6);
+    assert_eq!(run(framebuffer.draw(&mut display)), Err(()));
+    assert!(!framebuffer.dirty_tiles[0]);
+    assert_eq!(framebuffer.dirty_tiles.count_ones(), 3);
+    display.spi.fail_at = None;
+    run(framebuffer.partial_draw_batched(&mut display)).unwrap();
+    assert!(!framebuffer.dirty_tiles.any());
+    assert_panel_matches(
+        &display.spi.writes,
+        17,
+        19,
+        &[0x001f_u16.swap_bytes(); 17 * 19],
+    );
+}
+
+#[test]
+fn custom_storage_batches_wide_rows_with_bounded_scratch() {
+    let mut framebuffer =
+        FrameBuffer::<480, 32, { 480 * 32 }, _>::with_storage(AtomicStorage::<{ 480 * 32 }>::new());
+    let mut display = display();
+    run(framebuffer.draw(&mut display)).unwrap();
+    display.spi.writes.clear();
+    framebuffer
+        .fill_solid(
+            &Rectangle::new(Point::zero(), Size::new(480, 16)),
+            Rgb565::RED,
+        )
+        .unwrap();
+    run(framebuffer.partial_draw_batched(&mut display)).unwrap();
+    assert_eq!(display.spi.writes.len(), 12);
+    let mut expected = vec![0; 480 * 32];
+    expected[..480 * 16].fill(0xf800_u16.swap_bytes());
+    assert_panel_matches(&display.spi.writes, 480, 32, &expected);
+}
+
+#[test]
+fn borrowed_storage_is_dirty_on_attach_and_remains_zero_copy() {
+    let mut pixels = [0xf800_u16.swap_bytes(); 32 * 16];
+    let expected_pointer = pixels.as_ptr() as usize;
+    let mut framebuffer = FrameBuffer::<32, 16, 512, _>::with_storage(&mut pixels[..]);
+    let mut display = display();
+    run(framebuffer.partial_draw_batched(&mut display)).unwrap();
+    assert_eq!(display.spi.pointers[5], expected_pointer);
+    assert_eq!(&display.spi.writes[5][..2], &[0xf8, 0x00]);
+}
+
+#[test]
+#[should_panic(expected = "Framebuffer storage length mismatch")]
+fn mismatched_storage_is_rejected_at_construction() {
+    FrameBuffer::<16, 16, 256, _>::with_storage([0; 255]);
+}
+
+#[test]
+fn eighty_percent_dirty_uses_full_frame_transfer() {
+    let mut framebuffer = FrameBuffer::<80, 16, { 80 * 16 }>::new();
+    framebuffer
+        .fill_solid(
+            &Rectangle::new(Point::zero(), Size::new(64, 16)),
+            Rgb565::RED,
+        )
+        .unwrap();
+    let mut display = display();
+    run(framebuffer.partial_draw_batched(&mut display)).unwrap();
+    assert_eq!(display.spi.writes.len(), 6);
+    assert_eq!(display.spi.writes[5].len(), 80 * 16 * 2);
+}
+
 #[derive(Default)]
 struct RecordingSpi {
     writes: Vec<Vec<u8>>,

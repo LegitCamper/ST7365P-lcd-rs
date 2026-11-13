@@ -6,6 +6,7 @@
 pub mod instruction;
 use crate::instruction::Instruction;
 mod fb;
+pub use fb::{DefaultPixelStorage, PixelStorage};
 pub use fb::{DrawSyncError, FrameBuffer, ScanDirection, ScanSyncConfig};
 
 #[cfg(all(test, feature = "graphics"))]

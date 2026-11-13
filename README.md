@@ -72,13 +72,34 @@ Run host regression checks with `cargo test -p st7365p-lcd --test scan_sync`.
 
 ## Drawing and flushing
 
+`FrameBuffer<W, H, SIZE>` uses `DefaultPixelStorage<SIZE>` (an owned `[u16; SIZE]`)
+by default; `FrameBuffer::new()` and `framebuffer!(W, H)` remain unchanged.
+Use `FrameBuffer::<W, H, SIZE, _>::with_storage(&mut pixels[..])` to borrow an
+existing pixel allocation instead. Attached storage starts entirely dirty;
+the default zero-filled constructor preserves its initially clean state.
+
+Both backends share clipping, drawing, dirty tracking and every flush method.
+Arrays and mutable slices implement `PixelStorage` through `AsRef<[u16]>` and
+`AsMut<[u16]>`, including bulk fill/copy and zero-copy transfers. Custom backends
+implement `len`, `read`, and `write`; default bulk operations use those methods.
+`as_slice` is optional: without it, transfers copy pixels into bounded staging
+buffers. Stored words are byte-swapped RGB565, matching the existing buffered
+transport; `DrawTarget` handles this conversion for callers.
+
+Do not expose a non-atomic slice over concurrently modified atomic storage.
+Storage abstraction does not synchronize dirty tracking or support external
+pixel writes: keep all drawing and flushing serialized through the framebuffer.
+An atomic backend still needs a separate publication protocol before concurrent
+writers can be supported.
+
 The `embedded-graphics::DrawTarget` API and framebuffer flush methods are unchanged.
 `draw_iter` and `fill_contiguous` dirty only tiles containing changed pixels.
 `fill_solid` and `clear` use bulk fills and still mark their affected tiles dirty.
 
 `partial_draw_batched` streams every dirty run, borrows full-width framebuffer
-slices without copying, and uses a full-frame transfer when all visible tiles
-are dirty. Tiles become clean only after a successful transfer; errors or dropped
+slices without copying, and uses a full refresh when at least 80% of visible tiles
+are dirty. Backends without slices use staged tiles for full refreshes.
+Tiles become clean only after a successful transfer; errors or dropped
 flush futures leave unsent tiles dirty for retry. Edge tiles use clipped windows
 and matching payload lengths. Controller delays remain unchanged; batched address
 parameters reduce the number of writes and waits instead.
@@ -92,8 +113,8 @@ Choose the flush API according to latency and tearing requirements:
 
 - `draw`: sends the entire framebuffer immediately, without scan synchronization.
 - `partial_draw`: sends dirty 16x16 tiles immediately.
-- `partial_draw_batched`: batches dirty tiles for throughput; all-dirty frames
-  use one full-frame transfer.
+- `partial_draw_batched`: batches dirty tiles for throughput; 80%-dirty frames
+  use a full refresh (one transfer when storage exposes a slice).
 - `draw_sync`: sends only dirty tiles, checking GSCAN separately before each
   tile. It waits whenever the scan overlaps that tile or would reach it before
   the configured transfer budget expires. This trades throughput and latency
