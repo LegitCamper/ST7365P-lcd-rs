@@ -17,6 +17,41 @@ use std::{
 
 struct AtomicStorage<const SIZE: usize>([core::sync::atomic::AtomicU16; SIZE]);
 
+#[test]
+fn snapshot_handoff_preserves_new_drawing_and_failed_uploads() {
+    fn check(storage: impl PixelStorage) {
+        let mut framebuffer = FrameBuffer::<19, 35, 665, _>::with_storage(storage);
+        let mut snapshot = [0; 665];
+        assert_eq!(framebuffer.take_dirty_rows(&mut snapshot), Ok(Some(0..35)));
+        assert_eq!(framebuffer.take_dirty_rows(&mut snapshot), Ok(None));
+
+        framebuffer.draw_iter([Pixel(Point::new(18, 34), Rgb565::RED)]).unwrap();
+        assert_eq!(framebuffer.take_dirty_rows(&mut []), Err(()));
+        assert_eq!(framebuffer.dirty_rows(), Some(32..35));
+        assert_eq!(framebuffer.take_dirty_rows(&mut snapshot), Ok(Some(32..35)));
+        let red = RawU16::from(Rgb565::RED).into_inner().swap_bytes();
+        assert_eq!(snapshot[664], red);
+
+        framebuffer.draw_iter([
+            Pixel(Point::new(18, 34), Rgb565::BLUE),
+            Pixel(Point::new(0, 0), Rgb565::GREEN),
+        ]).unwrap();
+        assert_eq!(snapshot[664], red);
+        framebuffer.retry_rows(32..35).unwrap();
+        assert_eq!(framebuffer.dirty_rows(), Some(0..35));
+        assert_eq!(framebuffer.take_dirty_rows(&mut snapshot), Ok(Some(0..35)));
+        assert_eq!(snapshot[664], RawU16::from(Rgb565::BLUE).into_inner().swap_bytes());
+        assert_eq!(snapshot[0], RawU16::from(Rgb565::GREEN).into_inner().swap_bytes());
+        for rows in [0..0, 1..16, 16..17, 32..36, 48..64] {
+            assert_eq!(framebuffer.retry_rows(rows), Err(()));
+            assert_eq!(framebuffer.dirty_rows(), None);
+        }
+    }
+    check([0; 665]);
+    check(&mut [0; 665][..]);
+    check(AtomicStorage::<665>::new());
+}
+
 impl<const SIZE: usize> AtomicStorage<SIZE> {
     fn new() -> Self {
         Self(core::array::from_fn(|_| {

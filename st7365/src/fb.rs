@@ -193,6 +193,47 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
         framebuffer
     }
 
+    /// Full-width tile-aligned band containing all dirty pixels, clipped to HEIGHT.
+    pub fn dirty_rows(&self) -> Option<Range<usize>> {
+        let visible = &self.dirty_tiles[..Self::TILES_X * Self::TILES_Y];
+        let first = visible.first_one()? / Self::TILES_X;
+        let last = visible.last_one()? / Self::TILES_X;
+        Some(first * TILE_SIZE..((last + 1) * TILE_SIZE).min(HEIGHT))
+    }
+
+    /// Copies dirty rows into a separate whole-screen buffer and clears their flags.
+    ///
+    /// The caller must serialize this operation with drawing, then may release its
+    /// lock while uploading the snapshot. On upload failure, call `retry_rows`.
+    /// Invalid destination lengths return Err without changing dirty state.
+    pub fn take_dirty_rows(&mut self, destination: &mut [u16]) -> Result<Option<Range<usize>>, ()> {
+        if destination.len() != SIZE {
+            return Err(());
+        }
+        let Some(rows) = self.dirty_rows() else {
+            return Ok(None);
+        };
+        let start = rows.start * WIDTH;
+        self.buffer.copy_into(start, &mut destination[start..rows.end * WIDTH]);
+        self.dirty_tiles[..Self::TILES_X * Self::TILES_Y].fill(false);
+        Ok(Some(rows))
+    }
+
+    /// Re-marks a failed snapshot without clearing pixels dirtied since capture.
+    /// Invalid, empty, or non-tile-aligned bands return Err without mutation.
+    pub fn retry_rows(&mut self, rows: Range<usize>) -> Result<(), ()> {
+        if rows.start >= rows.end
+            || rows.end > HEIGHT
+            || rows.start % TILE_SIZE != 0
+            || (rows.end != HEIGHT && rows.end % TILE_SIZE != 0)
+        {
+            return Err(());
+        }
+        self.dirty_tiles[rows.start / TILE_SIZE * Self::TILES_X
+            ..rows.end.div_ceil(TILE_SIZE) * Self::TILES_X].fill(true);
+        Ok(())
+    }
+
     fn mark_tiles_dirty(&mut self, rect: Rectangle) {
         let start_tx = (rect.top_left.x as usize) / TILE_SIZE;
         let end_tx = ((rect.top_left.x + rect.size.width as i32 - 1) as usize) / TILE_SIZE;
