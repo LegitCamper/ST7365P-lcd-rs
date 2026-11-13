@@ -9,7 +9,10 @@ mod fb;
 pub use fb::FrameBuffer;
 
 use embedded_hal::digital::OutputPin;
-use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
+use embedded_hal_async::{
+    delay::DelayNs,
+    spi::{Operation, SpiDevice},
+};
 
 const MAX_SCREEN_WIDTH: usize = 320;
 const MAX_SCREEN_HEIGHT: usize = 480;
@@ -60,6 +63,15 @@ pub enum Orientation {
     LandscapeSwapped = 0xA0,
 }
 
+/// Failure while waiting for a new panel scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsyncError {
+    /// The SPI device or data/command pin failed.
+    Interface,
+    /// No scanline wrap was observed within the requested number of reads.
+    Timeout,
+}
+
 impl<SPI, DC, RST, DELAY> ST7365P<SPI, DC, RST, DELAY>
 where
     SPI: SpiDevice,
@@ -86,6 +98,13 @@ where
             dy: 0,
             delay,
         }
+    }
+
+    /// Accesses the SPI device, for example to select a slower clock for reads.
+    ///
+    /// Finish configuration changes before issuing display commands.
+    pub fn spi_mut(&mut self) -> &mut SPI {
+        &mut self.spi
     }
 
     /// Runs commands to initialize the display.
@@ -172,9 +191,8 @@ where
     // little-endian assertion above); this just reinterprets them as bytes
     // and issues a single DMA write instead of copying word-by-word.
     async fn write_words_buffered(&mut self, words: &[u16]) -> Result<(), ()> {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 2)
-        };
+        let bytes =
+            unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 2) };
         self.write_data(bytes).await
     }
 
@@ -212,6 +230,81 @@ where
         self.write_command(Instruction::VSCSAD, &params).await?;
 
         Ok(())
+    }
+
+    /// Enables vertical-only TE output at a physical scanline (STE, 0x44).
+    ///
+    /// Zero selects vertical blanking, equivalent to TEON with TEM=0. The
+    /// setting takes effect next frame and is independent of MADCTL's MV bit.
+    /// Choose a line within the panel's configured scan period, including porches.
+    /// This only programs the TE output; it does not wait or delay RAM writes.
+    /// A wired TE input must be awaited separately, or use `wait_for_vsync`.
+    pub async fn set_tear_scanline(&mut self, scanline: u16) -> Result<(), ()> {
+        self.write_command(Instruction::STE, &scanline.to_be_bytes())
+            .await
+    }
+
+    /// Disables the TE output. Scanline reads do not require TE to be enabled.
+    pub async fn disable_tearing_effect(&mut self) -> Result<(), ()> {
+        self.write_command(Instruction::TEOFF, &[]).await
+    }
+
+    /// Reads the physical scanline counter (GSCAN, 0x45) over 4-wire SPI.
+    ///
+    /// Requires SDO/MISO wiring and an awake panel. Configure the SPI clock for
+    /// reads: the datasheet specifies a minimum 150 ns period (at most 6.66 MHz)
+    /// and 60 ns high/low times. `SpiDevice` cannot change clock speed itself.
+    /// The count includes sync and porch lines, not just visible framebuffer rows.
+    /// D/C stays low and CS stays asserted across command and response. Serial
+    /// GSCAN returns two MSB-first bytes, without the parallel-interface dummy byte.
+    pub async fn read_scanline(&mut self) -> Result<u16, ()> {
+        self.dc.set_low().map_err(|_| ())?;
+        let command = [Instruction::GSCAN as u8];
+        let mut response = [0; 2];
+        self.spi
+            .transaction(&mut [
+                Operation::DelayNs(60),
+                Operation::Write(&command),
+                Operation::Read(&mut response),
+                Operation::DelayNs(65),
+            ])
+            .await
+            .map_err(|_| ())?;
+        Ok(u16::from_be_bytes(response))
+    }
+
+    /// Waits for the next observed scanline wrap, then returns before any upload.
+    ///
+    /// Call once immediately before a framebuffer flush, not once per tile.
+    /// Uses at most `max_polls` reads, including the initial sample; fewer than
+    /// two reads time out. Constant zero/all-one responses also time out, rather than
+    /// treating an absent or stuck MISO line as vertical blanking. The polling
+    /// limit is not a wall-clock timeout if the underlying SPI operation stalls.
+    ///
+    /// Requires the same read timing as `read_scanline`. No TE connection or
+    /// `set_tear_scanline` call is needed. Synchronizing the start alone cannot
+    /// prevent tearing if the scan catches the upload or scan/write orders differ.
+    pub async fn wait_for_vsync(&mut self, max_polls: u32) -> Result<(), VsyncError> {
+        if max_polls < 2 {
+            return Err(VsyncError::Timeout);
+        }
+        let mut previous = self
+            .read_scanline()
+            .await
+            .map_err(|_| VsyncError::Interface)?;
+        for _ in 1..max_polls {
+            // ponytail: 50 us polling; use a wired TE interrupt for tighter synchronization.
+            self.delay.delay_us(50).await;
+            let current = self
+                .read_scanline()
+                .await
+                .map_err(|_| VsyncError::Interface)?;
+            if current < previous {
+                return Ok(());
+            }
+            previous = current;
+        }
+        Err(VsyncError::Timeout)
     }
 
     pub async fn set_orientation(&mut self, orientation: &Orientation) -> Result<(), ()> {

@@ -6,4 +6,68 @@ Two versions:
 - Synchrouous (which is in master branch)
 - Asynchronous `branch = "async"`
 
+## Scan synchronization (async branch)
+
+`display.wait_for_vsync(max_polls).await` polls **GSCAN (0x45)** until
+the physical scanline counter wraps. Call it immediately before a framebuffer
+flush, once per update, not once per tile. It does not require TE output to be
+enabled. `read_scanline()` also exposes the counter for diagnostics.
+
+The old experimental read split the command and response across two SPI
+transactions, deasserting CS between them. Reads now keep CS asserted throughout,
+with D/C low, and decode two MSB-first serial bytes. The dummy read in the parallel
+command table is not an extra serial byte. The extra serial dummy clock shown for
+RDDID/RDDST is specific to those commands, not GSCAN.
+
+**SPI reads need a slower clock than writes.** The datasheet specifies a minimum
+150 ns read clock period (6.66 MHz maximum) and 60 ns high/low times. Use 6 MHz or
+less. `SpiDevice` has no portable clock configuration API; `spi_mut()` provides
+access to your HAL's configuration. With the example's Embassy `ExclusiveDevice`:
+
+```rust,ignore
+config.frequency = 6_000_000;
+display.spi_mut().bus_mut().set_config(&config);
+let sync = display.wait_for_vsync(2_000).await;
+config.frequency = 32_000_000;
+display.spi_mut().bus_mut().set_config(&config);
+sync.unwrap(); // Or handle VsyncError::Timeout / VsyncError::Interface.
+framebuffer.partial_draw_batched(&mut display).await.unwrap();
+```
+
+Restore the write clock even when synchronization fails. The PicoCalc example
+logs failures and falls back to unsynchronized drawing rather than hanging.
+The existing 32 MHz write clock is empirical, not a datasheet-rated guarantee
+(the documented write period is at least 66 ns).
+
+- Stock PicoCalc V2.0 connects LCD SDO to GP12, but leaves TE unconnected. Use
+  scanline polling there, not a made-up GPIO for TE. The panel must be awake.
+- Polls are spaced by at least 50 us, plus SPI overhead. A 2,000-read budget
+  allows roughly 100 ms of polling delays. Constant zero or all-one responses
+  time out; check MISO wiring, SPI mode/speed and sleep state. A stalled HAL call
+  still needs an application-level wall-clock timeout.
+- Scanline zero starts vertical sync. Counts include porches and can exceed the
+  visible height. Polling detects a wrap, not an exact zero sample; it can return
+  shortly after vertical blanking starts, rather than precisely on its edge.
+- Starting in sync does **not** guarantee tear-free uploads: a 320x320 RGB565
+  frame takes at least 51.2 ms at 32 MHz, longer than a 60 Hz frame (16.7 ms).
+  Prefer small dirty updates; matching scan/write order and avoiding the panel
+  catching the writer still matter. No automatic waits are added to existing
+  drawing methods, and panel refresh settings are left unchanged.
+
+For boards with TE physically connected, `set_tear_scanline(line).await` sends
+**STE (0x44)** with a big-endian line number. Line zero selects vertical-only TE,
+equivalent to **TEON (0x35), TEM=0**. This programs an output signal, not a delayed
+RAM write. It takes effect next frame; await a fresh TE edge in your application
+before uploading, with a timeout. `disable_tearing_effect()` sends **TEOFF (0x34)**.
+Choose a physical line within the configured panel scan period; rotation does
+not convert framebuffer coordinates into TE timing.
+
+References: ST7365P specification V1.0, sections 7.4.3 (SPI timing), 8.4.2
+(4-wire serial reads), 9.2.35/9.2.36 (STE/GSCAN), and 10.8 (tearing examples),
+plus `clockwork_Mainboard_V2.0_Schematic.pdf` in `clockworkpi/PicoCalc`.
+Host checks cover command framing and polling behavior; panel timing still needs
+verification on real hardware.
+
+Run host regression checks with `cargo test -p st7365p-lcd --test scan_sync`.
+
 ![picocalc-example](https://github.com/LegitCamper/ST7365P-lcd-rs/blob/master/assets/picocalc-example.jpg)

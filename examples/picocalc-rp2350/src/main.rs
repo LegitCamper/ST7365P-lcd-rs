@@ -9,7 +9,7 @@ use embassy_rp::{
     gpio::{Level, Output},
     spi,
 };
-use embassy_time::{Delay, Timer};
+use embassy_time::Delay;
 use embedded_graphics::{Drawable, image::Image, pixelcolor::Rgb565, prelude::*};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use st7365p_lcd::{FrameBuffer, ST7365P, framebuffer};
@@ -25,7 +25,13 @@ async fn main(_spawner: Spawner) {
     let mut config = spi::Config::default();
     config.frequency = 32_000_000;
     let spi1 = spi::Spi::new(
-        p.SPI1, p.PIN_10, p.PIN_11, p.PIN_12, p.DMA_CH0, p.DMA_CH1, config,
+        p.SPI1,
+        p.PIN_10,
+        p.PIN_11,
+        p.PIN_12,
+        p.DMA_CH0,
+        p.DMA_CH1,
+        config.clone(),
     );
 
     let spi_device = ExclusiveDevice::new(spi1, Output::new(p.PIN_13, Level::Low), Delay).unwrap();
@@ -50,6 +56,18 @@ async fn main(_spawner: Spawner) {
     let image = Image::new(&bmp, Point::new(0, y_offset));
 
     image.draw(&mut framebuffer).unwrap();
+
+    config.frequency = 6_000_000;
+    display.spi_mut().bus_mut().set_config(&config);
+    let sync = display.wait_for_vsync(2_000).await;
+    config.frequency = 32_000_000;
+    display.spi_mut().bus_mut().set_config(&config);
+    if let Err(error) = sync {
+        defmt::warn!(
+            "LCD scan sync failed: {:?}; drawing unsynchronized",
+            defmt::Debug2Format(&error)
+        );
+    }
 
     framebuffer
         .partial_draw_batched(&mut display)
