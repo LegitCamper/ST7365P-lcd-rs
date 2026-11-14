@@ -3,6 +3,11 @@ use core::ops::Range;
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::{delay::DelayNs, spi::SpiDevice};
 
+mod diff;
+mod scan;
+pub use diff::DisplayState;
+pub use scan::ScanBatchConfig;
+
 /// Owned pixel storage used by [`FrameBuffer::new`].
 pub type DefaultPixelStorage<const SIZE: usize> = [u16; SIZE];
 
@@ -146,7 +151,7 @@ pub struct FrameBuffer<
 }
 
 impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WIDTH, HEIGHT, SIZE> {
-    /// Constructs a new framebuffer.
+    /// Constructs a black framebuffer with every visible tile dirty.
     ///
     /// # Panics
     /// Panics if dimensions are zero, exceed `u16::MAX`, require more than
@@ -154,9 +159,15 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize> FrameBuffer<WID
     #[allow(dead_code)]
     pub const fn new() -> Self {
         Self::validate_dimensions();
+        let mut dirty_tiles = bitarr!(usize, Lsb0; 0;TILE_COUNT);
+        let mut tile = 0;
+        while tile < Self::TILES_X * Self::TILES_Y {
+            dirty_tiles.data[tile / usize::BITS as usize] |= 1 << (tile % usize::BITS as usize);
+            tile += 1;
+        }
         Self {
             buffer: [0_u16; SIZE],
-            dirty_tiles: bitarr!(usize, Lsb0; 0;TILE_COUNT),
+            dirty_tiles,
         }
     }
 }
@@ -214,7 +225,8 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
             return Ok(None);
         };
         let start = rows.start * WIDTH;
-        self.buffer.copy_into(start, &mut destination[start..rows.end * WIDTH]);
+        self.buffer
+            .copy_into(start, &mut destination[start..rows.end * WIDTH]);
         self.dirty_tiles[..Self::TILES_X * Self::TILES_Y].fill(false);
         Ok(Some(rows))
     }
@@ -229,21 +241,10 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
         {
             return Err(());
         }
-        self.dirty_tiles[rows.start / TILE_SIZE * Self::TILES_X
-            ..rows.end.div_ceil(TILE_SIZE) * Self::TILES_X].fill(true);
+        self.dirty_tiles
+            [rows.start / TILE_SIZE * Self::TILES_X..rows.end.div_ceil(TILE_SIZE) * Self::TILES_X]
+            .fill(true);
         Ok(())
-    }
-
-    fn mark_tiles_dirty(&mut self, rect: Rectangle) {
-        let start_tx = (rect.top_left.x as usize) / TILE_SIZE;
-        let end_tx = ((rect.top_left.x + rect.size.width as i32 - 1) as usize) / TILE_SIZE;
-        let start_ty = (rect.top_left.y as usize) / TILE_SIZE;
-        let end_ty = ((rect.top_left.y + rect.size.height as i32 - 1) as usize) / TILE_SIZE;
-
-        for ty in start_ty..=end_ty {
-            self.dirty_tiles[ty * Self::TILES_X + start_tx..=ty * Self::TILES_X + end_tx]
-                .fill(true);
-        }
     }
 
     fn set_pixel(&mut self, x: usize, y: usize, color: u16) {
@@ -265,8 +266,8 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
         DC: OutputPin,
         RST: OutputPin,
     {
+        self.dirty_tiles[..Self::TILES_X * Self::TILES_Y].fill(true);
         let Some(pixels) = self.buffer.as_slice() else {
-            self.dirty_tiles[..Self::TILES_X * Self::TILES_Y].fill(true);
             return self.partial_draw(display).await;
         };
         display
@@ -334,126 +335,6 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
         Ok(())
     }
 
-    /// Flushes dirty tiles only when the physical scan leaves time to finish.
-    ///
-    /// Each tile gets a fresh moving GSCAN sample before writing. A tile is
-    /// eligible before or after its scan interval only if the next visit is
-    /// farther away than `write_budget_lines + 1`. Even an all-dirty framebuffer
-    /// stays tiled; no unsynchronized full-frame fallback is used.
-    ///
-    /// Keep SPI at a read-safe clock (6 MHz or less) for this entire call. The
-    /// driver does not change clocks. Packets contain at most 256 RGB565 pixels.
-    /// Only completed tiles become clean; errors or cancellation leave the
-    /// current and remaining tiles dirty for retry. An unchanged buffer does
-    /// no I/O, even with an invalid configuration.
-    ///
-    /// Tear avoidance depends on accurate physical mapping and a conservative
-    /// transfer budget. Unbounded async scheduling delays cannot be protected
-    /// against. Tiles may appear in different frames: this is not an atomic
-    /// frame swap. Apply an application-level timeout if the HAL can stall.
-    pub async fn draw_sync<SPI, DC, RST, DELAY>(
-        &mut self,
-        display: &mut ST7365P<SPI, DC, RST, DELAY>,
-        config: &ScanSyncConfig,
-    ) -> Result<(), DrawSyncError>
-    where
-        SPI: SpiDevice,
-        DC: OutputPin,
-        RST: OutputPin,
-        DELAY: DelayNs,
-    {
-        if !self.dirty_tiles[..Self::TILES_X * Self::TILES_Y].any() {
-            return Ok(());
-        }
-        let scan_extent = match config.direction {
-            ScanDirection::TopToBottom | ScanDirection::BottomToTop => HEIGHT,
-            ScanDirection::LeftToRight | ScanDirection::RightToLeft => WIDTH,
-        };
-        let frame_lines = usize::from(config.frame_scanlines);
-        let first_line = usize::from(config.first_scanline);
-        let budget = usize::from(config.write_budget_lines);
-        if first_line + scan_extent > frame_lines
-            || budget == 0
-            || budget + TILE_SIZE.min(scan_extent) + 1 >= frame_lines
-            || WIDTH - 1 + usize::from(display.dx) > u16::MAX as usize
-            || HEIGHT - 1 + usize::from(display.dy) > u16::MAX as usize
-        {
-            return Err(DrawSyncError::InvalidConfig);
-        }
-
-        // ponytail: fixed-size tiles at one read-safe clock; batch only with measured timing bounds.
-        let mut tile_buffer = [0u16; TILE_SIZE * TILE_SIZE];
-        let mut polls_left = config.max_polls;
-        for tile_y in 0..Self::TILES_Y {
-            for tile_x in 0..Self::TILES_X {
-                let tile_index = tile_y * Self::TILES_X + tile_x;
-                if !self.dirty_tiles[tile_index] {
-                    continue;
-                }
-                if polls_left < 2 {
-                    return Err(DrawSyncError::Timeout);
-                }
-                let rect_x = tile_x * TILE_SIZE;
-                let rect_y = tile_y * TILE_SIZE;
-                let rect_width = TILE_SIZE.min(WIDTH - rect_x);
-                let rect_height = TILE_SIZE.min(HEIGHT - rect_y);
-                for row in 0..rect_height {
-                    let source = (rect_y + row) * WIDTH + rect_x;
-                    self.buffer.copy_into(
-                        source,
-                        &mut tile_buffer[row * rect_width..(row + 1) * rect_width],
-                    );
-                }
-                let (scan_start, scan_length) = match config.direction {
-                    ScanDirection::TopToBottom => (rect_y, rect_height),
-                    ScanDirection::BottomToTop => (HEIGHT - rect_y - rect_height, rect_height),
-                    ScanDirection::LeftToRight => (rect_x, rect_width),
-                    ScanDirection::RightToLeft => (WIDTH - rect_x - rect_width, rect_width),
-                };
-                let scan_start = first_line + scan_start;
-                let scan_end = scan_start + scan_length;
-                let mut previous = None;
-                loop {
-                    if polls_left == 0 {
-                        return Err(DrawSyncError::Timeout);
-                    }
-                    if previous.is_some() {
-                        display.delay.delay_us(50).await;
-                    }
-                    let current = display
-                        .read_scanline()
-                        .await
-                        .map_err(|_| DrawSyncError::Interface)?;
-                    polls_left -= 1;
-                    if current >= config.frame_scanlines {
-                        return Err(DrawSyncError::InvalidScanline(current));
-                    }
-                    let current = usize::from(current);
-                    let distance = (scan_start + frame_lines - current) % frame_lines;
-                    if previous.is_some_and(|last| last != current)
-                        && !(scan_start..scan_end).contains(&current)
-                        && distance > budget + 1
-                    {
-                        break;
-                    }
-                    previous = Some(current);
-                }
-                display
-                    .set_pixels_buffered(
-                        rect_x as u16,
-                        rect_y as u16,
-                        (rect_x + rect_width - 1) as u16,
-                        (rect_y + rect_height - 1) as u16,
-                        &tile_buffer[..rect_width * rect_height],
-                    )
-                    .await
-                    .map_err(|_| DrawSyncError::Interface)?;
-                self.dirty_tiles.set(tile_index, false);
-            }
-        }
-        Ok(())
-    }
-
     /// Sends only dirty tiles (16x16px) in batches to the display
     pub async fn partial_draw_batched<SPI, DC, RST, DELAY>(
         &mut self,
@@ -469,7 +350,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
         if !visible_tiles.any() {
             return Ok(());
         }
-        if visible_tiles.count_ones() * 100 >= visible_tiles.len() * 80 {
+        if visible_tiles.all() && self.buffer.as_slice().is_some() {
             return self.draw(display).await;
         }
 
@@ -503,7 +384,21 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
                 let rect_x = tx * TILE_SIZE;
                 let rect_y = ty * TILE_SIZE;
                 let rect_width = (width_tiles * TILE_SIZE).min(WIDTH - rect_x);
-                let rect_height = TILE_SIZE.min(HEIGHT - rect_y);
+                let mut rect_height = TILE_SIZE.min(HEIGHT - rect_y);
+                let mut height_tiles = 1;
+                let full_width =
+                    rect_x == 0 && rect_width == WIDTH && self.buffer.as_slice().is_some();
+                while ty + height_tiles < Self::TILES_Y {
+                    let next_start = (ty + height_tiles) * Self::TILES_X + tx;
+                    let next_height = ((height_tiles + 1) * TILE_SIZE).min(HEIGHT - rect_y);
+                    if (!full_width && rect_width * next_height > pixel_buffer.len())
+                        || !self.dirty_tiles[next_start..next_start + width_tiles].all()
+                    {
+                        break;
+                    }
+                    height_tiles += 1;
+                    rect_height = next_height;
+                }
                 let contiguous = self
                     .buffer
                     .as_slice()
@@ -531,7 +426,10 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
                     )
                     .await?;
 
-                self.dirty_tiles[start_tile..start_tile + width_tiles].fill(false);
+                for tile_y in ty..ty + height_tiles {
+                    let start = tile_y * Self::TILES_X + tx;
+                    self.dirty_tiles[start..start + width_tiles].fill(false);
+                }
                 tx += width_tiles;
             }
         }
@@ -634,18 +532,27 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
         let color = RawU16::from(color).into_inner().swap_bytes();
 
         for y in start_y..start_y + height {
-            let start = y * WIDTH + start_x;
-            self.buffer.fill_range(start..start + width, color);
+            let mut x = start_x;
+            while x < start_x + width {
+                let end_x = ((x / TILE_SIZE + 1) * TILE_SIZE).min(start_x + width);
+                let range = y * WIDTH + x..y * WIDTH + end_x;
+                let changed = match self.buffer.as_slice() {
+                    Some(buffer) => buffer[range.clone()].iter().any(|pixel| *pixel != color),
+                    None => range.clone().any(|index| self.buffer.read(index) != color),
+                };
+                if changed {
+                    self.buffer.fill_range(range, color);
+                    self.dirty_tiles
+                        .set(y / TILE_SIZE * Self::TILES_X + x / TILE_SIZE, true);
+                }
+                x = end_x;
+            }
         }
-        self.mark_tiles_dirty(drawable_area);
         Ok(())
     }
 
     fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
-        self.buffer
-            .fill_range(0..SIZE, RawU16::from(color).into_inner().swap_bytes());
-        self.dirty_tiles[..Self::TILES_X * Self::TILES_Y].fill(true);
-        Ok(())
+        self.fill_solid(&Rectangle::new(Point::zero(), self.size()), color)
     }
 }
 

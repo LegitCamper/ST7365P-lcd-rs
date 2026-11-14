@@ -9,10 +9,10 @@ use embassy_rp::{
     gpio::{Level, Output},
     spi,
 };
-use embassy_time::Delay;
+use embassy_time::{Delay, Instant};
 use embedded_graphics::{Drawable, image::Image, pixelcolor::Rgb565, prelude::*};
 use embedded_hal_bus::spi::ExclusiveDevice;
-use st7365p_lcd::{FrameBuffer, ST7365P, framebuffer};
+use st7365p_lcd::{FrameBuffer, ST7365P, framebuffer, spi::ReadWriteSpi};
 use tinybmp::Bmp;
 
 const SCREEN_WIDTH: usize = 320;
@@ -35,6 +35,11 @@ async fn main(_spawner: Spawner) {
     );
 
     let spi_device = ExclusiveDevice::new(spi1, Output::new(p.PIN_13, Level::Low), Delay).unwrap();
+    let spi_device = ReadWriteSpi::new(spi_device, move |device, reads| {
+        config.frequency = if reads { 6_000_000 } else { 32_000_000 };
+        device.bus_mut().set_config(&config);
+        Ok(())
+    });
     let mut display = ST7365P::new(
         spi_device,
         Output::new(p.PIN_14, Level::Low),
@@ -55,13 +60,13 @@ async fn main(_spawner: Spawner) {
     let y_offset = bmp.size().height as i32 / 4;
     let image = Image::new(&bmp, Point::new(0, y_offset));
 
+    let render_started = Instant::now();
     image.draw(&mut framebuffer).unwrap();
+    let render_us = render_started.elapsed().as_micros();
 
-    config.frequency = 6_000_000;
-    display.spi_mut().bus_mut().set_config(&config);
+    let sync_started = Instant::now();
     let sync = display.wait_for_vsync(2_000).await;
-    config.frequency = 32_000_000;
-    display.spi_mut().bus_mut().set_config(&config);
+    let sync_us = sync_started.elapsed().as_micros();
     if let Err(error) = sync {
         defmt::warn!(
             "LCD scan sync failed: {:?}; drawing unsynchronized",
@@ -69,10 +74,17 @@ async fn main(_spawner: Spawner) {
         );
     }
 
+    let flush_started = Instant::now();
     framebuffer
         .partial_draw_batched(&mut display)
         .await
         .unwrap();
+    defmt::info!(
+        "LCD render={}us sync={}us flush={}us",
+        render_us,
+        sync_us,
+        flush_started.elapsed().as_micros()
+    );
 
     loop {}
 }

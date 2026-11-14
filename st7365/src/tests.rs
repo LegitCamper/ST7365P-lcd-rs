@@ -17,6 +17,18 @@ use std::{
 
 struct AtomicStorage<const SIZE: usize>([core::sync::atomic::AtomicU16; SIZE]);
 
+mod frame_diff;
+mod scan_batches;
+mod spi_clock;
+mod updates;
+
+fn synchronized_black_framebuffer<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize>(
+) -> FrameBuffer<WIDTH, HEIGHT, SIZE> {
+    let mut framebuffer = FrameBuffer::new();
+    run(framebuffer.draw(&mut display())).unwrap();
+    framebuffer
+}
+
 #[test]
 fn snapshot_handoff_preserves_new_drawing_and_failed_uploads() {
     fn check(storage: impl PixelStorage) {
@@ -25,23 +37,33 @@ fn snapshot_handoff_preserves_new_drawing_and_failed_uploads() {
         assert_eq!(framebuffer.take_dirty_rows(&mut snapshot), Ok(Some(0..35)));
         assert_eq!(framebuffer.take_dirty_rows(&mut snapshot), Ok(None));
 
-        framebuffer.draw_iter([Pixel(Point::new(18, 34), Rgb565::RED)]).unwrap();
+        framebuffer
+            .draw_iter([Pixel(Point::new(18, 34), Rgb565::RED)])
+            .unwrap();
         assert_eq!(framebuffer.take_dirty_rows(&mut []), Err(()));
         assert_eq!(framebuffer.dirty_rows(), Some(32..35));
         assert_eq!(framebuffer.take_dirty_rows(&mut snapshot), Ok(Some(32..35)));
         let red = RawU16::from(Rgb565::RED).into_inner().swap_bytes();
         assert_eq!(snapshot[664], red);
 
-        framebuffer.draw_iter([
-            Pixel(Point::new(18, 34), Rgb565::BLUE),
-            Pixel(Point::new(0, 0), Rgb565::GREEN),
-        ]).unwrap();
+        framebuffer
+            .draw_iter([
+                Pixel(Point::new(18, 34), Rgb565::BLUE),
+                Pixel(Point::new(0, 0), Rgb565::GREEN),
+            ])
+            .unwrap();
         assert_eq!(snapshot[664], red);
         framebuffer.retry_rows(32..35).unwrap();
         assert_eq!(framebuffer.dirty_rows(), Some(0..35));
         assert_eq!(framebuffer.take_dirty_rows(&mut snapshot), Ok(Some(0..35)));
-        assert_eq!(snapshot[664], RawU16::from(Rgb565::BLUE).into_inner().swap_bytes());
-        assert_eq!(snapshot[0], RawU16::from(Rgb565::GREEN).into_inner().swap_bytes());
+        assert_eq!(
+            snapshot[664],
+            RawU16::from(Rgb565::BLUE).into_inner().swap_bytes()
+        );
+        assert_eq!(
+            snapshot[0],
+            RawU16::from(Rgb565::GREEN).into_inner().swap_bytes()
+        );
         for rows in [0..0, 1..16, 16..17, 32..36, 48..64] {
             assert_eq!(framebuffer.retry_rows(rows), Err(()));
             assert_eq!(framebuffer.dirty_rows(), None);
@@ -177,8 +199,8 @@ fn mismatched_storage_is_rejected_at_construction() {
 }
 
 #[test]
-fn eighty_percent_dirty_uses_full_frame_transfer() {
-    let mut framebuffer = FrameBuffer::<80, 16, { 80 * 16 }>::new();
+fn eighty_percent_dirty_preserves_clean_pixels() {
+    let mut framebuffer = synchronized_black_framebuffer::<80, 16, { 80 * 16 }>();
     framebuffer
         .fill_solid(
             &Rectangle::new(Point::zero(), Size::new(64, 16)),
@@ -188,7 +210,7 @@ fn eighty_percent_dirty_uses_full_frame_transfer() {
     let mut display = display();
     run(framebuffer.partial_draw_batched(&mut display)).unwrap();
     assert_eq!(display.spi.writes.len(), 6);
-    assert_eq!(display.spi.writes[5].len(), 80 * 16 * 2);
+    assert_eq!(display.spi.writes[5].len(), 64 * 16 * 2);
 }
 
 #[derive(Default)]
@@ -341,7 +363,7 @@ fn address_window_batches_parameters_and_preserves_offsets() {
 
 #[test]
 fn sparse_pixels_only_dirty_changed_tiles_in_any_order() {
-    let mut framebuffer = FrameBuffer::<64, 48, { 64 * 48 }>::new();
+    let mut framebuffer = synchronized_black_framebuffer::<64, 48, { 64 * 48 }>();
     let pixels = [
         Pixel(Point::new(63, 47), Rgb565::RED),
         Pixel(Point::zero(), Rgb565::GREEN),
@@ -380,7 +402,7 @@ fn clipped_and_short_contiguous_fills_match_pixel_iteration() {
             let colors: Vec<_> = (0..length)
                 .map(|index| Rgb565::from(RawU16::new(index + 1)))
                 .collect();
-            let mut expected = FrameBuffer::<17, 19, { 17 * 19 }>::new();
+            let mut expected = synchronized_black_framebuffer::<17, 19, { 17 * 19 }>();
             expected
                 .draw_iter(
                     area.points()
@@ -388,7 +410,7 @@ fn clipped_and_short_contiguous_fills_match_pixel_iteration() {
                         .map(|(point, color)| Pixel(point, color)),
                 )
                 .unwrap();
-            let mut actual = FrameBuffer::<17, 19, { 17 * 19 }>::new();
+            let mut actual = synchronized_black_framebuffer::<17, 19, { 17 * 19 }>();
             actual
                 .fill_contiguous(&area, colors.iter().copied())
                 .unwrap();
@@ -411,11 +433,11 @@ fn solid_fills_clip_once_and_match_pixel_iteration() {
         Rectangle::new(Point::zero(), Size::new(0, 5)),
         Rectangle::new(Point::zero(), Size::new(5, 0)),
     ] {
-        let mut expected = FrameBuffer::<17, 19, { 17 * 19 }>::new();
+        let mut expected = synchronized_black_framebuffer::<17, 19, { 17 * 19 }>();
         expected
             .draw_iter(area.points().map(|point| Pixel(point, Rgb565::RED)))
             .unwrap();
-        let mut actual = FrameBuffer::<17, 19, { 17 * 19 }>::new();
+        let mut actual = synchronized_black_framebuffer::<17, 19, { 17 * 19 }>();
         actual.fill_solid(&area, Rgb565::RED).unwrap();
         assert_eq!(actual.buffer, expected.buffer);
         assert_eq!(actual.dirty_tiles, expected.dirty_tiles);
@@ -424,7 +446,7 @@ fn solid_fills_clip_once_and_match_pixel_iteration() {
 
 #[test]
 fn fragmented_flush_drains_more_than_thirty_runs() {
-    let mut framebuffer = FrameBuffer::<320, 320, { 320 * 320 }>::new();
+    let mut framebuffer = synchronized_black_framebuffer::<320, 320, { 320 * 320 }>();
     for tile_y in 0..20 {
         for tile_x in (tile_y % 2..20).step_by(2) {
             framebuffer
@@ -441,7 +463,7 @@ fn fragmented_flush_drains_more_than_thirty_runs() {
 
 #[test]
 fn full_width_run_borrows_framebuffer_memory() {
-    let mut framebuffer = FrameBuffer::<32, 48, { 32 * 48 }>::new();
+    let mut framebuffer = synchronized_black_framebuffer::<32, 48, { 32 * 48 }>();
     framebuffer
         .fill_solid(
             &Rectangle::new(Point::new(0, 16), Size::new(32, 16)),
@@ -459,7 +481,7 @@ fn full_width_run_borrows_framebuffer_memory() {
 
 #[test]
 fn full_width_run_can_exceed_scratch_capacity_without_copying() {
-    let mut framebuffer = FrameBuffer::<480, 32, { 480 * 32 }>::new();
+    let mut framebuffer = synchronized_black_framebuffer::<480, 32, { 480 * 32 }>();
     framebuffer
         .fill_solid(
             &Rectangle::new(Point::zero(), Size::new(480, 16)),
@@ -476,7 +498,7 @@ fn full_width_run_can_exceed_scratch_capacity_without_copying() {
 
 #[test]
 fn clear_flushes_dense_frame_in_one_borrowed_transfer() {
-    let mut framebuffer = FrameBuffer::<320, 320, { 320 * 320 }>::new();
+    let mut framebuffer = synchronized_black_framebuffer::<320, 320, { 320 * 320 }>();
     framebuffer.clear(Rgb565::RED).unwrap();
     assert_eq!(framebuffer.dirty_tiles.count_ones(), 400);
     assert!(framebuffer
@@ -496,7 +518,7 @@ fn clear_flushes_dense_frame_in_one_borrowed_transfer() {
 #[test]
 fn both_partial_flushes_pack_edge_tiles_without_padding() {
     for batched in [false, true] {
-        let mut framebuffer = FrameBuffer::<17, 19, { 17 * 19 }>::new();
+        let mut framebuffer = synchronized_black_framebuffer::<17, 19, { 17 * 19 }>();
         framebuffer
             .draw_iter([
                 Pixel(Point::new(16, 0), Rgb565::RED),
@@ -518,7 +540,7 @@ fn both_partial_flushes_pack_edge_tiles_without_padding() {
 #[test]
 fn failed_transfers_preserve_unsent_tiles_for_retry() {
     for fail_at in 0..12 {
-        let mut framebuffer = FrameBuffer::<64, 32, { 64 * 32 }>::new();
+        let mut framebuffer = synchronized_black_framebuffer::<64, 32, { 64 * 32 }>();
         framebuffer
             .draw_iter([
                 Pixel(Point::zero(), Rgb565::RED),
@@ -542,7 +564,7 @@ fn failed_transfers_preserve_unsent_tiles_for_retry() {
 #[test]
 fn cancelled_transfers_preserve_unsent_tiles_for_retry() {
     for pending_at in [5, 11] {
-        let mut framebuffer = FrameBuffer::<64, 32, { 64 * 32 }>::new();
+        let mut framebuffer = synchronized_black_framebuffer::<64, 32, { 64 * 32 }>();
         framebuffer
             .draw_iter([
                 Pixel(Point::zero(), Rgb565::RED),
@@ -570,7 +592,7 @@ fn cancelled_transfers_preserve_unsent_tiles_for_retry() {
 
 #[test]
 fn failed_dense_flush_keeps_entire_frame_dirty() {
-    let mut framebuffer = FrameBuffer::<17, 19, { 17 * 19 }>::new();
+    let mut framebuffer = synchronized_black_framebuffer::<17, 19, { 17 * 19 }>();
     framebuffer.clear(Rgb565::BLUE).unwrap();
     let mut display = display();
     display.spi.fail_at = Some(5);
@@ -595,20 +617,20 @@ fn scan_config() -> ScanSyncConfig {
 
 #[test]
 fn sync_draw_checks_each_tile_and_never_uses_dense_fallback() {
-    let mut framebuffer = FrameBuffer::<17, 19, { 17 * 19 }>::new();
+    let mut framebuffer = synchronized_black_framebuffer::<17, 19, { 17 * 19 }>();
     framebuffer.clear(Rgb565::BLUE).unwrap();
     let mut display = display();
-    display.spi.scanlines = [10, 22, 23, 15, 23, 24, 25, 26, 27, 30].map(Ok).into();
+    display.spi.scanlines = [30, 31, 32, 33, 34, 35, 36, 37].map(Ok).into();
     run(framebuffer.draw_sync(&mut display, &scan_config())).unwrap();
     assert_panel_matches(&display.spi.writes, 17, 19, &framebuffer.buffer);
     assert_eq!(display.spi.writes.len(), 24);
-    assert_eq!(display.spi.reads_at_write[5], 3);
-    assert_eq!(display.spi.reads_at_write[11], 5);
-    assert_eq!(display.spi.reads_at_write[17], 8);
-    assert_eq!(display.spi.reads_at_write[23], 10);
+    assert_eq!(display.spi.reads_at_write[5], 2);
+    assert_eq!(display.spi.reads_at_write[11], 4);
+    assert_eq!(display.spi.reads_at_write[17], 6);
+    assert_eq!(display.spi.reads_at_write[23], 8);
     assert!(!framebuffer.dirty_tiles.any());
     run(framebuffer.draw_sync(&mut display, &scan_config())).unwrap();
-    assert_eq!(display.spi.reads, 10);
+    assert_eq!(display.spi.reads, 8);
     assert_eq!(display.spi.writes.len(), 24);
 }
 
@@ -622,7 +644,7 @@ fn sync_draw_windows_exclude_scan_and_transfer_deadline_in_every_direction() {
     ] {
         for tile_index in 0..4 {
             for scanline in 0..80 {
-                let mut framebuffer = FrameBuffer::<17, 19, { 17 * 19 }>::new();
+                let mut framebuffer = synchronized_black_framebuffer::<17, 19, { 17 * 19 }>();
                 framebuffer.dirty_tiles.set(tile_index, true);
                 let mut display = display();
                 display.spi.scanlines = [Ok((scanline + 79) % 80), Ok(scanline)].into();
@@ -664,7 +686,7 @@ fn sync_draw_windows_exclude_scan_and_transfer_deadline_in_every_direction() {
 
 #[test]
 fn sync_draw_waits_across_frame_wrap_instead_of_racing_scan() {
-    let mut framebuffer = FrameBuffer::<16, 16, 256>::new();
+    let mut framebuffer = synchronized_black_framebuffer::<16, 16, 256>();
     framebuffer.clear(Rgb565::RED).unwrap();
     let config = ScanSyncConfig {
         first_scanline: 0,
@@ -678,7 +700,7 @@ fn sync_draw_waits_across_frame_wrap_instead_of_racing_scan() {
 
 #[test]
 fn sync_draw_uses_explicit_physical_mapping_with_address_offsets() {
-    let mut framebuffer = FrameBuffer::<16, 16, 256>::new();
+    let mut framebuffer = synchronized_black_framebuffer::<16, 16, 256>();
     framebuffer.clear(Rgb565::RED).unwrap();
     let config = ScanSyncConfig {
         first_scanline: 64,
@@ -695,7 +717,7 @@ fn sync_draw_uses_explicit_physical_mapping_with_address_offsets() {
 
 #[test]
 fn sync_draw_uses_one_poll_budget_for_entire_flush() {
-    let mut framebuffer = FrameBuffer::<32, 16, 512>::new();
+    let mut framebuffer = synchronized_black_framebuffer::<32, 16, 512>();
     framebuffer.clear(Rgb565::RED).unwrap();
     let config = ScanSyncConfig {
         max_polls: 4,
@@ -731,7 +753,7 @@ fn sync_draw_rejects_stuck_invalid_and_failed_reads_without_writing() {
             DrawSyncError::Interface,
         ),
     ] {
-        let mut framebuffer = FrameBuffer::<16, 16, 256>::new();
+        let mut framebuffer = synchronized_black_framebuffer::<16, 16, 256>();
         framebuffer.clear(Rgb565::RED).unwrap();
         let mut display = display();
         display.spi.scanlines = samples.into();
@@ -754,7 +776,7 @@ fn sync_draw_read_failure_after_progress_preserves_only_unfinished_tiles() {
         (Err(ErrorKind::Other), DrawSyncError::Interface),
         (Ok(80), DrawSyncError::InvalidScanline(80)),
     ] {
-        let mut framebuffer = FrameBuffer::<32, 16, 512>::new();
+        let mut framebuffer = synchronized_black_framebuffer::<32, 16, 512>();
         framebuffer.clear(Rgb565::RED).unwrap();
         let mut display = display();
         display.spi.scanlines = [Ok(23), Ok(24), sample].into();
@@ -792,7 +814,7 @@ fn sync_draw_validates_configuration_and_poll_budget_before_io() {
             ..scan_config()
         },
     ] {
-        let mut framebuffer = FrameBuffer::<16, 16, 256>::new();
+        let mut framebuffer = synchronized_black_framebuffer::<16, 16, 256>();
         let mut display = display();
         run(framebuffer.draw_sync(&mut display, &config)).unwrap();
         framebuffer.clear(Rgb565::RED).unwrap();
@@ -804,7 +826,7 @@ fn sync_draw_validates_configuration_and_poll_budget_before_io() {
         assert_eq!(display.spi.reads, 0);
     }
     for max_polls in [0, 1] {
-        let mut framebuffer = FrameBuffer::<16, 16, 256>::new();
+        let mut framebuffer = synchronized_black_framebuffer::<16, 16, 256>();
         framebuffer.clear(Rgb565::RED).unwrap();
         let mut display = display();
         let config = ScanSyncConfig {
@@ -818,7 +840,7 @@ fn sync_draw_validates_configuration_and_poll_budget_before_io() {
         assert_eq!(display.spi.reads, 0);
     }
     for offsets in [(u16::MAX, 0), (0, u16::MAX)] {
-        let mut framebuffer = FrameBuffer::<16, 16, 256>::new();
+        let mut framebuffer = synchronized_black_framebuffer::<16, 16, 256>();
         framebuffer.clear(Rgb565::RED).unwrap();
         let mut display = display();
         display.set_offset(offsets.0, offsets.1);
@@ -833,7 +855,7 @@ fn sync_draw_validates_configuration_and_poll_budget_before_io() {
 #[test]
 fn sync_draw_write_failures_preserve_unsent_tiles_for_retry() {
     for fail_at in 0..12 {
-        let mut framebuffer = FrameBuffer::<32, 16, 512>::new();
+        let mut framebuffer = synchronized_black_framebuffer::<32, 16, 512>();
         framebuffer.clear(Rgb565::RED).unwrap();
         let mut display = display();
         display.spi.scanlines = [23, 24, 25, 26].map(Ok).into();
@@ -861,7 +883,7 @@ fn sync_draw_cancellation_during_poll_or_write_preserves_unsent_tiles() {
         (None, Some(5), 2),
         (None, Some(11), 1),
     ] {
-        let mut framebuffer = FrameBuffer::<32, 16, 512>::new();
+        let mut framebuffer = synchronized_black_framebuffer::<32, 16, 512>();
         framebuffer.clear(Rgb565::RED).unwrap();
         let mut display = display();
         display.spi.scanlines = [23, 24, 25, 26].map(Ok).into();

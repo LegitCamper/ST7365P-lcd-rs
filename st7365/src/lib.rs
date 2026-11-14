@@ -4,8 +4,11 @@
 //! This crate provides a ST7365P driver to connect to TFT displays.
 
 pub mod instruction;
+pub mod spi;
 use crate::instruction::Instruction;
 mod fb;
+pub use fb::DisplayState;
+pub use fb::ScanBatchConfig;
 pub use fb::{DefaultPixelStorage, PixelStorage};
 pub use fb::{DrawSyncError, FrameBuffer, ScanDirection, ScanSyncConfig};
 

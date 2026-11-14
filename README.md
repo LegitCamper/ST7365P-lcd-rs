@@ -21,21 +21,30 @@ RDDID/RDDST is specific to those commands, not GSCAN.
 
 **SPI reads need a slower clock than writes.** The datasheet specifies a minimum
 150 ns read clock period (6.66 MHz maximum) and 60 ns high/low times. Use 6 MHz or
-less. `SpiDevice` has no portable clock configuration API; `spi_mut()` provides
-access to your HAL's configuration. With the example's Embassy `ExclusiveDevice`:
+less. `SpiDevice` has no portable clock configuration API. The example wraps its
+Embassy `ExclusiveDevice` in `spi::ReadWriteSpi`, selecting clocks before each
+transaction using the HAL's existing configuration API:
 
 ```rust,ignore
-config.frequency = 6_000_000;
-display.spi_mut().bus_mut().set_config(&config);
-let sync = display.wait_for_vsync(2_000).await;
-config.frequency = 32_000_000;
-display.spi_mut().bus_mut().set_config(&config);
-sync.unwrap(); // Or handle VsyncError::Timeout / VsyncError::Interface.
-framebuffer.partial_draw_batched(&mut display).await.unwrap();
+use st7365p_lcd::spi::ReadWriteSpi;
+
+let device = ReadWriteSpi::new(spi_device, move |device, reads| {
+    config.frequency = if reads { 6_000_000 } else { 32_000_000 };
+    device.bus_mut().set_config(&config);
+    Ok(())
+});
+let mut display = ST7365P::new(device, dc, rst, false, true, Delay);
 ```
 
-Restore the write clock even when synchronization fails. The PicoCalc example
-logs failures and falls back to unsynchronized drawing rather than hanging.
+The GSCAN command and response stay in one read-speed transaction. Writes select
+the write clock, including after an error. The callback requires an exclusively
+owned idle bus; it cannot reconfigure a shared bus outside its lock. After
+cancellation, recover CS/DMA if the underlying transport requires it before
+starting another transaction. Without this wrapper, keep synchronized drawing
+at a read-safe clock, or restore clocks explicitly when manually switching.
+The PicoCalc example logs failures and falls back to unsynchronized drawing
+rather than hanging. It logs render, sync-wait, and flush durations separately;
+these measurements do not substitute for worst-case packet timing calibration.
 The existing 32 MHz write clock is empirical, not a datasheet-rated guarantee
 (the documented write period is at least 66 ns).
 
@@ -73,10 +82,11 @@ Run host regression checks with `cargo test -p st7365p-lcd --test scan_sync`.
 ## Drawing and flushing
 
 `FrameBuffer<W, H, SIZE>` uses `DefaultPixelStorage<SIZE>` (an owned `[u16; SIZE]`)
-by default; `FrameBuffer::new()` and `framebuffer!(W, H)` remain unchanged.
+by default; `FrameBuffer::new()` and `framebuffer!(W, H)` remain const-compatible.
 Use `FrameBuffer::<W, H, SIZE, _>::with_storage(&mut pixels[..])` to borrow an
-existing pixel allocation instead. Attached storage starts entirely dirty;
-the default zero-filled constructor preserves its initially clean state.
+existing pixel allocation instead. Both constructors start entirely dirty:
+initial framebuffer contents are not assumed to match the panel. The first
+partial flush therefore initializes every visible pixel, including black pixels.
 
 Both backends share clipping, drawing, dirty tracking and every flush method.
 Arrays and mutable slices implement `PixelStorage` through `AsRef<[u16]>` and
@@ -92,20 +102,65 @@ pixel writes: keep all drawing and flushing serialized through the framebuffer.
 An atomic backend still needs a separate publication protocol before concurrent
 writers can be supported.
 
-The `embedded-graphics::DrawTarget` API and framebuffer flush methods are unchanged.
-`draw_iter` and `fill_contiguous` dirty only tiles containing changed pixels.
-`fill_solid` and `clear` use bulk fills and still mark their affected tiles dirty.
+All `DrawTarget` methods, including `fill_solid` and `clear`, dirty only tiles
+containing changed pixels. Repeating an identical fill after a successful flush
+does no SPI work. Identical writes never clear an already pending dirty flag.
+Solid fills retain bulk writes within changed tile-row segments.
 
-`partial_draw_batched` streams every dirty run, borrows full-width framebuffer
-slices without copying, and uses a full refresh when at least 80% of visible tiles
-are dirty. Backends without slices use staged tiles for full refreshes.
+`partial_draw_batched` merges horizontal dirty runs and extends matching spans
+vertically. Staged rectangles fit the existing 5,120-pixel scratch buffer;
+full-width contiguous bands borrow framebuffer slices without copying. A
+full-frame shortcut applies only when every tile is dirty and storage exposes
+a slice. Non-slice storage retains batching even for dense updates. The old 80%
+threshold is removed: clean pixels are not uploaded merely to save windows.
 Tiles become clean only after a successful transfer; errors or dropped
 flush futures leave unsent tiles dirty for retry. Edge tiles use clipped windows
 and matching payload lengths. Controller delays remain unchanged; batched address
 parameters reduce the number of writes and waits instead.
+Explicit `draw()` marks the entire frame dirty before starting, so a failed or
+cancelled full refresh can be retried through a partial flush, even when the
+framebuffer was previously clean.
 
-Run host regression tests with `cargo test -p st7365p-lcd --lib` (also with
+Run host regression tests with `cargo test -p st7365p-lcd --lib --tests` (also with
 `--release`). Actual draw times still require measurements on the target hardware.
+
+### Exact final-frame comparison
+
+Clearing and redrawing a scene can change pixels temporarily even when its final
+image matches the panel. For exact suppression, opt into `draw_diff` with
+caller-owned `DisplayState` storage:
+
+```rust,ignore
+use st7365p_lcd::DisplayState;
+
+let mut previous_pixels = [0u16; WIDTH * HEIGHT];
+let mut history = DisplayState::<WIDTH, HEIGHT, { WIDTH * HEIGHT }, _>::new(
+    &mut previous_pixels[..],
+);
+framebuffer.draw_diff(&mut display, &mut history).await?;
+```
+
+History starts invalid, so the first call uploads the whole frame. Later calls
+compare final pixels exactly, without hashes or collision risk, even if snapshot
+capture cleared dirty flags. This reads the whole framebuffer per call and needs
+one extra RGB565 image supplied by the caller; ordinary flush APIs have no extra
+frame-history cost. History updates only after complete success. Failed or
+cancelled transfers invalidate attempted tiles, so reverting pixels before retry
+cannot hide a partially transmitted update.
+
+Keep one history per framebuffer/display pair. Call `history.invalidate()` after
+panel reset, orientation/offset changes, other upload APIs, direct display writes,
+or switching framebuffer instances. `draw_diff` uses unsynchronized batching;
+it does not make frame presentation atomic.
+
+### Snapshot handoff
+
+`take_dirty_rows` copies a full-width band into caller storage and clears captured
+dirty flags so drawing can continue while a separate snapshot is uploaded.
+Keep that snapshot immutable while it is in flight. Call `retry_rows` after a
+failed **or cancelled** upload; it preserves newer drawing. A captured snapshot
+is not proof of a successful panel update and must not be treated as valid
+display history. This handoff is separate from rectangle batching.
 
 ### Scan-aware partial updates
 
@@ -113,13 +168,16 @@ Choose the flush API according to latency and tearing requirements:
 
 - `draw`: sends the entire framebuffer immediately, without scan synchronization.
 - `partial_draw`: sends dirty 16x16 tiles immediately.
-- `partial_draw_batched`: batches dirty tiles for throughput; 80%-dirty frames
-  use a full refresh (one transfer when storage exposes a slice).
+- `partial_draw_batched`: batches dirty rectangles for throughput, preserving
+  clean tiles and borrowing full-width bands where possible.
+- `draw_diff`: suppresses unchanged final tiles using caller-owned display history.
 - `draw_sync`: sends only dirty tiles, checking GSCAN separately before each
-  tile. It waits whenever the scan overlaps that tile or would reach it before
-  the configured transfer budget expires. This trades throughput and latency
+  tile. If a tile is unsafe, it searches for another safe dirty tile before
+  waiting. Staging finishes before the final validating scan sample. This trades throughput and latency
   for reduced local tearing; it never silently falls back to unsynchronized
   drawing, even for an all-dirty frame.
+- `draw_sync_batched`: applies the same checks to bounded rectangular packets
+  with an explicitly measured packet budget, never an unsynchronized fallback.
 
 `draw_sync` needs a `ScanSyncConfig` calibrated for your panel and workload.
 There are deliberately no guessed refresh-rate, porch, or orientation defaults.
@@ -141,12 +199,7 @@ let sync = ScanSyncConfig {
     max_polls: 2_000,
 };
 
-// Reads and writes share one read-safe clock throughout draw_sync.
-config.frequency = 6_000_000;
-display.spi_mut().bus_mut().set_config(&config);
 let result = framebuffer.draw_sync(&mut display, &sync).await;
-config.frequency = 32_000_000; // Restore your board's chosen write clock.
-display.spi_mut().bus_mut().set_config(&config);
 
 match result {
     Ok(()) => {}
@@ -158,12 +211,12 @@ match result {
 **Timing budget matters.** `write_budget_lines` is a nonzero upper bound on
 elapsed scanline periods from the accepted GSCAN sample until the last pixel
 of a 16x16 RGB565 tile has arrived. Include the remaining read time, address
-commands, SPI transfer, bus contention, async scheduling delays, and margin;
+commands, clock switching, SPI transfer, bus contention, async scheduling delays, and margin;
 round up. A tile contains at most 512 pixel bytes. The scheduler reserves one
 additional line before the next scan visit. Wire speed alone is not a sufficient
 budget, and unbounded executor delays cannot be made tear-free by polling.
 
-Each tile requires at least two reads showing counter movement; stuck values
+Each packet requires at least two reads showing counter movement; stuck values
 cannot immediately authorize a write. `max_polls` limits reads across the entire
 flush, not per tile. Polls within a tile wait are spaced by at least 50 us. A HAL
 call that stalls still needs an application-level timeout. Out-of-range counter
@@ -172,11 +225,27 @@ values return `InvalidScanline`; impossible geometry or timing budgets return
 SPI activity. Only successfully uploaded tiles become clean, so failures or
 dropped futures preserve unfinished work for retry.
 
-This first version uses fixed 16x16 tiles and leaves SPI configuration alone.
-Keep the entire call at a read-safe clock; switching between every read and write
-is not built in. If an application timeout cancels the future, restore your SPI
-clock after that timeout result as well. Prefer `partial_draw_batched` when
-latency matters more than tearing.
+For scan-aware batching, supply a separate limit and budget:
+
+```rust,ignore
+use st7365p_lcd::ScanBatchConfig;
+
+let batches = ScanBatchConfig {
+    max_tiles: measured_packet_tile_limit,
+    write_budget_lines: measured_worst_case_packet_lines + safety_margin_lines,
+};
+framebuffer.draw_sync_batched(&mut display, &sync, &batches).await?;
+```
+
+`max_tiles` must be 1..=20. The packet budget must cover the largest admitted
+packet and be at least the single-tile budget. Horizontal strips are selected
+for top/bottom physical scanning; vertical strips for left/right scanning.
+This preserves the occupied scan interval while increasing payload size.
+**Do not reuse an unmeasured single-tile budget for larger packets.** Invalid
+geometry, impossible timing budgets, and invalid packet limits fail before I/O.
+Single-tile sync uses 512 bytes of pixel scratch; batched sync uses 10 KiB.
+Neither API guarantees atomic frame swaps or safety against unbounded delays.
+Recalibrate after changing batch limits, SPI clocks, orientation, or executor load.
 
 **Not an atomic frame swap.** Writes may occur before or after the scan passes a
 tile, and different tiles may become visible in different refreshes. Large images
