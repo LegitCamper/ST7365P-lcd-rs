@@ -38,6 +38,13 @@ pub trait PixelStorage {
         }
     }
 
+    /// Copies wire-format pixels into storage.
+    fn write_from(&mut self, start: usize, source: &[u16]) {
+        for (offset, pixel) in source.iter().copied().enumerate() {
+            self.write(start + offset, pixel);
+        }
+    }
+
     /// Optional zero-copy fast path. Concurrently mutable storage must return None.
     fn as_slice(&self) -> Option<&[u16]> {
         None
@@ -63,6 +70,10 @@ impl<Storage: AsRef<[u16]> + AsMut<[u16]>> PixelStorage for Storage {
 
     fn copy_into(&self, start: usize, destination: &mut [u16]) {
         destination.copy_from_slice(&self.as_ref()[start..start + destination.len()]);
+    }
+
+    fn write_from(&mut self, start: usize, source: &[u16]) {
+        self.as_mut()[start..start + source.len()].copy_from_slice(source);
     }
 
     fn as_slice(&self) -> Option<&[u16]> {
@@ -247,6 +258,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
         Ok(())
     }
 
+    #[cfg(feature = "graphics")]
     fn set_pixel(&mut self, x: usize, y: usize, color: u16) {
         let index = y * WIDTH + x;
         if self.buffer.read(index) != color {
@@ -268,16 +280,10 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
     {
         self.dirty_tiles[..Self::TILES_X * Self::TILES_Y].fill(true);
         let Some(pixels) = self.buffer.as_slice() else {
-            return self.partial_draw(display).await;
+            return self.draw_tiles(display).await;
         };
         display
-            .set_pixels_buffered(
-                0,
-                0,
-                self.size().width as u16 - 1,
-                self.size().height as u16 - 1,
-                pixels,
-            )
+            .set_pixels_buffered(0, 0, WIDTH as u16 - 1, HEIGHT as u16 - 1, pixels)
             .await?;
 
         self.dirty_tiles.fill(false);
@@ -286,7 +292,22 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
     }
 
     /// Sends only dirty tiles (16x16px) individually to the display without batching
+    #[deprecated(
+        note = "Use partial_draw_batched for throughput; this path retains 512-byte scratch"
+    )]
     pub async fn partial_draw<SPI, DC, RST, DELAY: DelayNs>(
+        &mut self,
+        display: &mut ST7365P<SPI, DC, RST, DELAY>,
+    ) -> Result<(), ()>
+    where
+        SPI: SpiDevice,
+        DC: OutputPin,
+        RST: OutputPin,
+    {
+        self.draw_tiles(display).await
+    }
+
+    async fn draw_tiles<SPI, DC, RST, DELAY: DelayNs>(
         &mut self,
         display: &mut ST7365P<SPI, DC, RST, DELAY>,
     ) -> Result<(), ()>
@@ -355,6 +376,31 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
         }
 
         let mut pixel_buffer = [0u16; MAX_META_TILES * TILE_SIZE * TILE_SIZE];
+        self.partial_draw_batched_with_scratch(display, &mut pixel_buffer)
+            .await
+    }
+
+    /// Batches dirty rectangles using reusable caller-owned scratch (5,120 words).
+    /// Initialize scratch once, then reuse it across flushes to avoid clearing
+    /// 10 KiB per call. Only staged pixels are transmitted; old contents are ignored.
+    pub async fn partial_draw_batched_with_scratch<SPI, DC, RST, DELAY>(
+        &mut self,
+        display: &mut ST7365P<SPI, DC, RST, DELAY>,
+        pixel_buffer: &mut [u16; MAX_META_TILES * TILE_SIZE * TILE_SIZE],
+    ) -> Result<(), ()>
+    where
+        SPI: SpiDevice,
+        DC: OutputPin,
+        RST: OutputPin,
+        DELAY: DelayNs,
+    {
+        let visible_tiles = &self.dirty_tiles[..Self::TILES_X * Self::TILES_Y];
+        if !visible_tiles.any() {
+            return Ok(());
+        }
+        if visible_tiles.all() && self.buffer.as_slice().is_some() {
+            return self.draw(display).await;
+        }
 
         for ty in 0..Self::TILES_Y {
             let mut tx = 0;
@@ -507,11 +553,31 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
             if skip > 0 && colors.nth(skip - 1).is_none() {
                 return Ok(());
             }
-            for x in start_x..start_x + width {
-                let Some(color) = colors.next() else {
+            let row_start = y * WIDTH;
+            let tile_row = y / TILE_SIZE * Self::TILES_X;
+            let mut x = start_x;
+            while x < start_x + width {
+                let end_x = ((x / TILE_SIZE + 1) * TILE_SIZE).min(start_x + width);
+                let mut changed = false;
+                let mut exhausted = false;
+                for index in row_start + x..row_start + end_x {
+                    let Some(color) = colors.next() else {
+                        exhausted = true;
+                        break;
+                    };
+                    let color = RawU16::from(color).into_inner().swap_bytes();
+                    if self.buffer.read(index) != color {
+                        self.buffer.write(index, color);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.dirty_tiles.set(tile_row + x / TILE_SIZE, true);
+                }
+                if exhausted {
                     return Ok(());
-                };
-                self.set_pixel(x, y, RawU16::from(color).into_inner().swap_bytes());
+                }
+                x = end_x;
             }
             skip = area.size.width as usize - width;
         }

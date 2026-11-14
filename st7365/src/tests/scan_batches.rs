@@ -65,7 +65,7 @@ fn synchronized_packets_merge_perpendicular_to_all_scan_directions() {
             ..scan_config()
         };
         run(framebuffer.draw_sync_batched(&mut display, &config, &batch_config(2))).unwrap();
-        assert_eq!(display.spi.writes.len(), 12);
+        assert_eq!(display.spi.writes.len(), 10);
         assert_eq!(display.spi.reads, 4);
         match direction {
             ScanDirection::TopToBottom | ScanDirection::BottomToTop => {
@@ -154,7 +154,7 @@ fn synchronized_packets_clip_edges_and_support_non_slice_storage() {
             ..scan_config()
         };
         run(framebuffer.draw_sync_batched(&mut display, &config, &batch_config(20))).unwrap();
-        assert_eq!(display.spi.writes.len(), 12);
+        assert_eq!(display.spi.writes.len(), 10);
         assert_panel_matches(&display.spi.writes, 17, 19, &[0x001f_u16.swap_bytes(); 323]);
     }
 }
@@ -166,12 +166,10 @@ fn synchronized_packets_respect_cap_and_do_not_cross_clean_gaps() {
     let mut display = display();
     display.spi.scanlines = (40..54).map(Ok).collect();
     run(framebuffer.draw_sync_batched(&mut display, &scan_config(), &batch_config(3))).unwrap();
-    assert_eq!(display.spi.writes.len(), 42);
-    assert!(display
-        .spi
-        .writes
-        .chunks_exact(6)
-        .all(|packet| packet[5].len() <= 3 * 512));
+    assert_eq!(display.spi.writes.len(), 30);
+    assert!(packets(&display.spi.writes)
+        .iter()
+        .all(|packet| packet.4.len() <= 3 * 512));
     assert_panel_matches(&display.spi.writes, 320, 16, &framebuffer.buffer);
 
     let mut framebuffer = FrameBuffer::<64, 16, 1024>::new();
@@ -186,7 +184,7 @@ fn synchronized_packets_respect_cap_and_do_not_cross_clean_gaps() {
     let mut display = super::display();
     display.spi.scanlines = [60, 61, 62, 63].map(Ok).into();
     run(framebuffer.draw_sync_batched(&mut display, &scan_config(), &batch_config(4))).unwrap();
-    assert_eq!(display.spi.writes.len(), 12);
+    assert_eq!(display.spi.writes.len(), 10);
     assert_eq!(display.spi.writes[1], [0, 0, 0, 15]);
     assert_eq!(display.spi.writes[7], [0, 32, 0, 63]);
     assert_panel_matches(&display.spi.writes, 64, 16, &framebuffer.buffer);
@@ -206,7 +204,7 @@ fn synchronized_packet_failure_and_cancellation_preserve_whole_packet() {
         );
         assert_eq!(framebuffer.dirty_tiles.count_ones(), 2);
         display.spi.fail_at = None;
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
         display.spi.scanlines = [60, 61].map(Ok).into();
         run(framebuffer.draw_sync_batched(&mut display, &scan_config(), &batch_config(2))).unwrap();
         assert_panel_matches(&display.spi.writes, 32, 16, &framebuffer.buffer);
@@ -234,7 +232,7 @@ fn synchronized_packet_failure_and_cancellation_preserve_whole_packet() {
         assert_eq!(framebuffer.dirty_tiles.count_ones(), 2);
         display.spi.pending_read_at = None;
         display.spi.pending_at = None;
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
         display.spi.scanlines = [60, 61].map(Ok).into();
         run(framebuffer.draw_sync_batched(&mut display, &config, &batches)).unwrap();
         assert_panel_matches(&display.spi.writes, 32, 16, &framebuffer.buffer);
@@ -333,10 +331,7 @@ fn batched_scan_uses_read_clock_for_samples_and_write_clock_for_packets() {
         &framebuffer.buffer,
     );
     drop(display);
-    assert_eq!(
-        clocks,
-        [true, true, false, false, false, false, false, false].repeat(2)
-    );
+    assert_eq!(clocks, [true, false].repeat(2));
 }
 
 #[test]
@@ -345,7 +340,7 @@ fn cancellation_after_completed_packet_retains_only_remaining_packet() {
     framebuffer.clear(Rgb565::RED).unwrap();
     let mut display = display();
     display.spi.scanlines = [60, 61, 62, 63].map(Ok).into();
-    display.spi.pending_at = Some(11);
+    display.spi.pending_at = Some(9);
     let config = scan_config();
     let batches = batch_config(2);
     {
@@ -361,7 +356,7 @@ fn cancellation_after_completed_packet_retains_only_remaining_packet() {
     assert!(framebuffer.dirty_tiles[2]);
     assert!(framebuffer.dirty_tiles[3]);
     display.spi.pending_at = None;
-    display.spi.writes.truncate(6);
+    display.spi.writes.truncate(8);
     display.spi.scanlines = [60, 61].map(Ok).into();
     run(framebuffer.draw_sync_batched(&mut display, &config, &batches)).unwrap();
     assert_panel_matches(&display.spi.writes, 32, 32, &framebuffer.buffer);

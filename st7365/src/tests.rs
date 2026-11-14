@@ -18,6 +18,7 @@ use std::{
 struct AtomicStorage<const SIZE: usize>([core::sync::atomic::AtomicU16; SIZE]);
 
 mod frame_diff;
+mod optimizations;
 mod scan_batches;
 mod spi_clock;
 mod updates;
@@ -103,7 +104,7 @@ fn storage_backends_share_drawing_and_wire_output() {
         let mut display = display();
         framebuffer.clear(Rgb565::BLACK).unwrap();
         run(framebuffer.draw(&mut display)).unwrap();
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
 
         framebuffer
             .fill_contiguous(
@@ -167,7 +168,7 @@ fn custom_storage_batches_wide_rows_with_bounded_scratch() {
         FrameBuffer::<480, 32, { 480 * 32 }, _>::with_storage(AtomicStorage::<{ 480 * 32 }>::new());
     let mut display = display();
     run(framebuffer.draw(&mut display)).unwrap();
-    display.spi.writes.clear();
+    display.spi_mut().writes.clear();
     framebuffer
         .fill_solid(
             &Rectangle::new(Point::zero(), Size::new(480, 16)),
@@ -175,7 +176,7 @@ fn custom_storage_batches_wide_rows_with_bounded_scratch() {
         )
         .unwrap();
     run(framebuffer.partial_draw_batched(&mut display)).unwrap();
-    assert_eq!(display.spi.writes.len(), 12);
+    assert_eq!(display.spi.writes.len(), 10);
     let mut expected = vec![0; 480 * 32];
     expected[..480 * 16].fill(0xf800_u16.swap_bytes());
     assert_panel_matches(&display.spi.writes, 480, 32, &expected);
@@ -223,6 +224,7 @@ struct RecordingSpi {
     reads: usize,
     reads_at_write: Vec<usize>,
     pending_read_at: Option<usize>,
+    write_delays: usize,
 }
 
 impl ErrorType for RecordingSpi {
@@ -252,6 +254,11 @@ impl SpiDevice for RecordingSpi {
             return Ok(());
         }
         for operation in operations {
+            if let Operation::DelayNs(nanos) = operation {
+                assert_eq!(*nanos, 1);
+                self.write_delays += 1;
+                continue;
+            }
             if self.fail_at == Some(self.writes.len()) {
                 return Err(ErrorKind::Other);
             }
@@ -292,7 +299,7 @@ struct Delay {
 
 impl DelayNs for Delay {
     async fn delay_ns(&mut self, nanos: u32) {
-        assert!(nanos == 1 || nanos == 50_000);
+        assert!(nanos == 50_000 || nanos == 10_000_000 || nanos == 200_000_000);
         self.calls += 1;
     }
 }
@@ -320,28 +327,49 @@ fn run<F: Future>(future: F) -> F::Output {
 }
 
 fn assert_panel_matches(writes: &[Vec<u8>], width: usize, height: usize, expected: &[u16]) {
-    assert_eq!(writes.len() % 6, 0);
     let mut panel = vec![0; width * height];
-    for transfer in writes.chunks(6) {
-        assert_eq!(transfer[0], [Instruction::CASET as u8]);
-        assert_eq!(transfer[2], [Instruction::RASET as u8]);
-        assert_eq!(transfer[4], [Instruction::RAMWR as u8]);
-        assert_eq!(transfer[1].len(), 4);
-        assert_eq!(transfer[3].len(), 4);
-        let start_x = u16::from_be_bytes([transfer[1][0], transfer[1][1]]) as usize;
-        let end_x = u16::from_be_bytes([transfer[1][2], transfer[1][3]]) as usize;
-        let start_y = u16::from_be_bytes([transfer[3][0], transfer[3][1]]) as usize;
-        let end_y = u16::from_be_bytes([transfer[3][2], transfer[3][3]]) as usize;
+    for (start_x, start_y, end_x, end_y, bytes) in packets(writes) {
         assert!(start_x <= end_x && end_x < width);
         assert!(start_y <= end_y && end_y < height);
         let rect_width = end_x - start_x + 1;
-        assert_eq!(transfer[5].len(), rect_width * (end_y - start_y + 1) * 2);
-        for (index, bytes) in transfer[5].chunks(2).enumerate() {
+        assert_eq!(bytes.len(), rect_width * (end_y - start_y + 1) * 2);
+        for (index, bytes) in bytes.chunks(2).enumerate() {
             let offset = (start_y + index / rect_width) * width + start_x + index % rect_width;
             panel[offset] = u16::from_ne_bytes([bytes[0], bytes[1]]);
         }
     }
     assert_eq!(panel, expected);
+}
+
+fn packets(writes: &[Vec<u8>]) -> Vec<(usize, usize, usize, usize, &[u8])> {
+    let mut columns = None;
+    let mut rows = None;
+    let mut packets = Vec::new();
+    let mut writes = writes.iter();
+    while let Some(command) = writes.next() {
+        let data = writes.next().expect("missing data");
+        match command.as_slice() {
+            [0x2a] | [0x2b] => {
+                assert_eq!(data.len(), 4);
+                let window = (
+                    u16::from_be_bytes([data[0], data[1]]) as usize,
+                    u16::from_be_bytes([data[2], data[3]]) as usize,
+                );
+                if command[0] == 0x2a {
+                    columns = Some(window);
+                } else {
+                    rows = Some(window);
+                }
+            }
+            [0x2c] => {
+                let (start_x, end_x) = columns.expect("missing column window");
+                let (start_y, end_y) = rows.expect("missing row window");
+                packets.push((start_x, start_y, end_x, end_y, data.as_slice()));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+    packets
 }
 
 #[test]
@@ -358,7 +386,7 @@ fn address_window_batches_parameters_and_preserves_offsets() {
             vec![0x02, 0x37, 0x04, 0x59],
         ]
     );
-    assert_eq!(display.delay.calls, 4);
+    assert_eq!(display.delay.calls, 0);
 }
 
 #[test]
@@ -456,7 +484,7 @@ fn fragmented_flush_drains_more_than_thirty_runs() {
     }
     let mut display = display();
     run(framebuffer.partial_draw_batched(&mut display)).unwrap();
-    assert_eq!(display.spi.writes.len(), 200 * 6);
+    assert_eq!(display.spi.writes.len(), 200 * 4 + 20 * 2);
     assert!(!framebuffer.dirty_tiles.any());
     assert_panel_matches(&display.spi.writes, 320, 320, &framebuffer.buffer);
 }
@@ -509,13 +537,14 @@ fn clear_flushes_dense_frame_in_one_borrowed_transfer() {
     let mut display = display();
     run(framebuffer.partial_draw_batched(&mut display)).unwrap();
     assert_eq!(display.spi.writes.len(), 6);
-    assert_eq!(display.delay.calls, 6);
+    assert_eq!(display.delay.calls, 0);
     assert_eq!(display.spi.pointers[5], expected_pointer);
     assert!(!framebuffer.dirty_tiles.any());
     assert_panel_matches(&display.spi.writes, 320, 320, &framebuffer.buffer);
 }
 
 #[test]
+#[allow(deprecated)]
 fn both_partial_flushes_pack_edge_tiles_without_padding() {
     for batched in [false, true] {
         let mut framebuffer = synchronized_black_framebuffer::<17, 19, { 17 * 19 }>();
@@ -539,7 +568,7 @@ fn both_partial_flushes_pack_edge_tiles_without_padding() {
 
 #[test]
 fn failed_transfers_preserve_unsent_tiles_for_retry() {
-    for fail_at in 0..12 {
+    for fail_at in 0..10 {
         let mut framebuffer = synchronized_black_framebuffer::<64, 32, { 64 * 32 }>();
         framebuffer
             .draw_iter([
@@ -554,16 +583,16 @@ fn failed_transfers_preserve_unsent_tiles_for_retry() {
         assert_eq!(framebuffer.dirty_tiles.count_ones(), remaining);
         assert!(framebuffer.dirty_tiles[3]);
         display.spi.fail_at = None;
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
         run(framebuffer.partial_draw_batched(&mut display)).unwrap();
-        assert_eq!(display.spi.writes.len(), remaining * 6);
+        assert_eq!(display.spi.writes.len(), 2 + remaining * 4);
         assert!(!framebuffer.dirty_tiles.any());
     }
 }
 
 #[test]
 fn cancelled_transfers_preserve_unsent_tiles_for_retry() {
-    for pending_at in [5, 11] {
+    for pending_at in [5, 9] {
         let mut framebuffer = synchronized_black_framebuffer::<64, 32, { 64 * 32 }>();
         framebuffer
             .draw_iter([
@@ -583,9 +612,9 @@ fn cancelled_transfers_preserve_unsent_tiles_for_retry() {
         let remaining = if pending_at < 6 { 2 } else { 1 };
         assert_eq!(framebuffer.dirty_tiles.count_ones(), remaining);
         display.spi.pending_at = None;
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
         run(framebuffer.partial_draw_batched(&mut display)).unwrap();
-        assert_eq!(display.spi.writes.len(), remaining * 6);
+        assert_eq!(display.spi.writes.len(), 2 + remaining * 4);
         assert!(!framebuffer.dirty_tiles.any());
     }
 }
@@ -599,7 +628,7 @@ fn failed_dense_flush_keeps_entire_frame_dirty() {
     assert_eq!(run(framebuffer.partial_draw_batched(&mut display)), Err(()));
     assert_eq!(framebuffer.dirty_tiles.count_ones(), 4);
     display.spi.fail_at = None;
-    display.spi.writes.clear();
+    display.spi_mut().writes.clear();
     run(framebuffer.partial_draw_batched(&mut display)).unwrap();
     assert_eq!(display.spi.writes.len(), 6);
     assert_panel_matches(&display.spi.writes, 17, 19, &framebuffer.buffer);
@@ -623,15 +652,15 @@ fn sync_draw_checks_each_tile_and_never_uses_dense_fallback() {
     display.spi.scanlines = [30, 31, 32, 33, 34, 35, 36, 37].map(Ok).into();
     run(framebuffer.draw_sync(&mut display, &scan_config())).unwrap();
     assert_panel_matches(&display.spi.writes, 17, 19, &framebuffer.buffer);
-    assert_eq!(display.spi.writes.len(), 24);
+    assert_eq!(display.spi.writes.len(), 20);
     assert_eq!(display.spi.reads_at_write[5], 2);
-    assert_eq!(display.spi.reads_at_write[11], 4);
-    assert_eq!(display.spi.reads_at_write[17], 6);
-    assert_eq!(display.spi.reads_at_write[23], 8);
+    assert_eq!(display.spi.reads_at_write[9], 4);
+    assert_eq!(display.spi.reads_at_write[15], 6);
+    assert_eq!(display.spi.reads_at_write[19], 8);
     assert!(!framebuffer.dirty_tiles.any());
     run(framebuffer.draw_sync(&mut display, &scan_config())).unwrap();
     assert_eq!(display.spi.reads, 8);
-    assert_eq!(display.spi.writes.len(), 24);
+    assert_eq!(display.spi.writes.len(), 20);
 }
 
 #[test]
@@ -735,7 +764,7 @@ fn sync_draw_uses_one_poll_budget_for_entire_flush() {
     assert!(framebuffer.dirty_tiles[1]);
     display.spi.scanlines = [Ok(23), Ok(24)].into();
     run(framebuffer.draw_sync(&mut display, &config)).unwrap();
-    assert_eq!(display.spi.writes.len(), 12);
+    assert_eq!(display.spi.writes.len(), 10);
     assert_panel_matches(&display.spi.writes, 32, 16, &framebuffer.buffer);
 }
 
@@ -854,7 +883,7 @@ fn sync_draw_validates_configuration_and_poll_budget_before_io() {
 
 #[test]
 fn sync_draw_write_failures_preserve_unsent_tiles_for_retry() {
-    for fail_at in 0..12 {
+    for fail_at in 0..10 {
         let mut framebuffer = synchronized_black_framebuffer::<32, 16, 512>();
         framebuffer.clear(Rgb565::RED).unwrap();
         let mut display = display();
@@ -867,10 +896,10 @@ fn sync_draw_write_failures_preserve_unsent_tiles_for_retry() {
         let remaining = if fail_at < 6 { 2 } else { 1 };
         assert_eq!(framebuffer.dirty_tiles.count_ones(), remaining);
         display.spi.fail_at = None;
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
         display.spi.scanlines = [23, 24, 25, 26].map(Ok).into();
         run(framebuffer.draw_sync(&mut display, &scan_config())).unwrap();
-        assert_eq!(display.spi.writes.len(), remaining * 6);
+        assert_eq!(display.spi.writes.len(), 2 + remaining * 4);
         assert!(!framebuffer.dirty_tiles.any());
     }
 }
@@ -881,7 +910,7 @@ fn sync_draw_cancellation_during_poll_or_write_preserves_unsent_tiles() {
         (Some(1), None, 2),
         (Some(3), None, 1),
         (None, Some(5), 2),
-        (None, Some(11), 1),
+        (None, Some(9), 1),
     ] {
         let mut framebuffer = synchronized_black_framebuffer::<32, 16, 512>();
         framebuffer.clear(Rgb565::RED).unwrap();
@@ -900,10 +929,10 @@ fn sync_draw_cancellation_during_poll_or_write_preserves_unsent_tiles() {
         assert_eq!(framebuffer.dirty_tiles.count_ones(), remaining);
         display.spi.pending_read_at = None;
         display.spi.pending_at = None;
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
         display.spi.scanlines = [23, 24, 25, 26].map(Ok).into();
         run(framebuffer.draw_sync(&mut display, &config)).unwrap();
-        assert_eq!(display.spi.writes.len(), remaining * 6);
+        assert_eq!(display.spi.writes.len(), 2 + remaining * 4);
         assert!(!framebuffer.dirty_tiles.any());
     }
 }

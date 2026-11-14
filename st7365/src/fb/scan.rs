@@ -45,11 +45,12 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
         RST: OutputPin,
         DELAY: DelayNs,
     {
-        self.draw_sync_packets::<{ TILE_SIZE * TILE_SIZE }, _, _, _, _>(
+        self.draw_sync_packets(
             display,
             config,
             1,
             config.write_budget_lines,
+            &mut [0; TILE_SIZE * TILE_SIZE],
         )
         .await
     }
@@ -74,6 +75,31 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
         RST: OutputPin,
         DELAY: DelayNs,
     {
+        self.draw_sync_batched_with_scratch(
+            display,
+            config,
+            batches,
+            &mut [0; MAX_META_TILES * TILE_SIZE * TILE_SIZE],
+        )
+        .await
+    }
+
+    /// Scan-aware batching with reusable caller-owned scratch (5,120 words).
+    /// Staging still finishes before the final fresh scan sample. Include all
+    /// other timing overheads in the packet budget, as with `draw_sync_batched`.
+    pub async fn draw_sync_batched_with_scratch<SPI, DC, RST, DELAY>(
+        &mut self,
+        display: &mut ST7365P<SPI, DC, RST, DELAY>,
+        config: &ScanSyncConfig,
+        batches: &ScanBatchConfig,
+        pixels: &mut [u16; MAX_META_TILES * TILE_SIZE * TILE_SIZE],
+    ) -> Result<(), DrawSyncError>
+    where
+        SPI: SpiDevice,
+        DC: OutputPin,
+        RST: OutputPin,
+        DELAY: DelayNs,
+    {
         if !self.dirty_tiles[..Self::TILES_X * Self::TILES_Y].any() {
             return Ok(());
         }
@@ -83,11 +109,12 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
         {
             return Err(DrawSyncError::InvalidConfig);
         }
-        self.draw_sync_packets::<{ MAX_META_TILES * TILE_SIZE * TILE_SIZE }, _, _, _, _>(
+        self.draw_sync_packets(
             display,
             config,
             batches.max_tiles,
             batches.write_budget_lines,
+            pixels,
         )
         .await
     }
@@ -155,12 +182,13 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
         }
     }
 
-    async fn draw_sync_packets<const CAPACITY: usize, SPI, DC, RST, DELAY>(
+    async fn draw_sync_packets<SPI, DC, RST, DELAY>(
         &mut self,
         display: &mut ST7365P<SPI, DC, RST, DELAY>,
         config: &ScanSyncConfig,
         max_tiles: usize,
         write_budget_lines: u16,
+        pixels: &mut [u16],
     ) -> Result<(), DrawSyncError>
     where
         SPI: SpiDevice,
@@ -188,14 +216,13 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
             return Err(DrawSyncError::InvalidConfig);
         }
 
-        let mut pixels = [0u16; CAPACITY];
         let mut polls_left = config.max_polls;
         while let Some(index) = self.dirty_tiles[..visible_count].first_one() {
             if polls_left < 2 {
                 return Err(DrawSyncError::Timeout);
             }
             let mut packet = self.scan_packet(index, config.direction, max_tiles);
-            self.stage_scan_packet(packet, &mut pixels);
+            self.stage_scan_packet(packet, pixels);
             let mut previous = None;
             loop {
                 if polls_left == 0 {
@@ -226,7 +253,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
                         })
                     {
                         packet = candidate;
-                        self.stage_scan_packet(packet, &mut pixels);
+                        self.stage_scan_packet(packet, pixels);
                     }
                 }
                 previous = Some(current);

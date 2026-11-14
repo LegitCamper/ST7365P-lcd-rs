@@ -3,6 +3,9 @@ name = "picocalc-rp2350"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+fast-spi = []
+
 [dependencies]
 embassy-executor = { version = "0.7", features = [
   "arch-cortex-m",

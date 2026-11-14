@@ -141,11 +141,11 @@ fn tear_scanline_is_big_endian_and_can_be_disabled() {
     assert_eq!(
         display.spi_mut().transactions,
         vec![
-            vec![Transfer::Write(vec![0x44])],
-            vec![Transfer::Write(vec![0x01, 0x23])],
-            vec![Transfer::Write(vec![0x44])],
-            vec![Transfer::Write(vec![0x00, 0x00])],
-            vec![Transfer::Write(vec![0x34])],
+            vec![Transfer::Delay(1), Transfer::Write(vec![0x44])],
+            vec![Transfer::Delay(1), Transfer::Write(vec![0x01, 0x23])],
+            vec![Transfer::Delay(1), Transfer::Write(vec![0x44])],
+            vec![Transfer::Delay(1), Transfer::Write(vec![0x00, 0x00])],
+            vec![Transfer::Delay(1), Transfer::Write(vec![0x34])],
         ]
     );
 }

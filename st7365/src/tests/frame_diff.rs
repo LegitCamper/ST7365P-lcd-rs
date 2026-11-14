@@ -42,7 +42,7 @@ fn invalid_history_uploads_black_even_when_framebuffer_flags_are_clean() {
     run(framebuffer.draw_diff(&mut display, &mut history)).unwrap();
     assert_eq!(display.spi.writes.len(), 6);
     assert_eq!(display.spi.writes[5], vec![0; 323 * 2]);
-    display.spi.writes.clear();
+    display.spi_mut().writes.clear();
     run(framebuffer.draw_diff(&mut display, &mut history)).unwrap();
     assert!(display.spi.writes.is_empty());
 
@@ -57,7 +57,7 @@ fn failed_diff_then_reverted_pixels_still_require_upload() {
     let mut history = DisplayState::new([0; 1024]);
     let mut display = display();
     run(framebuffer.draw_diff(&mut display, &mut history)).unwrap();
-    display.spi.writes.clear();
+    display.spi_mut().writes.clear();
 
     framebuffer
         .draw_iter([Pixel(Point::zero(), Rgb565::RED)])
@@ -71,7 +71,7 @@ fn failed_diff_then_reverted_pixels_still_require_upload() {
         .draw_iter([Pixel(Point::zero(), Rgb565::BLACK)])
         .unwrap();
     display.spi.fail_at = None;
-    display.spi.writes.clear();
+    display.spi_mut().writes.clear();
     run(framebuffer.draw_diff(&mut display, &mut history)).unwrap();
     assert_eq!(display.spi.writes.len(), 6);
     assert_eq!(display.spi.writes[5], vec![0; 16 * 16 * 2]);
@@ -83,14 +83,14 @@ fn cancelled_diff_retries_completed_tiles_even_after_snapshot_clears_flags() {
     let mut history = DisplayState::new([0; 2048]);
     let mut display = display();
     run(framebuffer.draw_diff(&mut display, &mut history)).unwrap();
-    display.spi.writes.clear();
+    display.spi_mut().writes.clear();
     framebuffer
         .draw_iter([
             Pixel(Point::zero(), Rgb565::RED),
             Pixel(Point::new(48, 0), Rgb565::BLUE),
         ])
         .unwrap();
-    display.spi.pending_at = Some(11);
+    display.spi.pending_at = Some(9);
     {
         let mut future = std::pin::pin!(framebuffer.draw_diff(&mut display, &mut history));
         assert!(future
@@ -110,11 +110,11 @@ fn cancelled_diff_retries_completed_tiles_even_after_snapshot_clears_flags() {
     assert!(!framebuffer.dirty_tiles.any());
 
     display.spi.pending_at = None;
-    display.spi.writes.clear();
+    display.spi_mut().writes.clear();
     run(framebuffer.draw_diff(&mut display, &mut history)).unwrap();
-    assert_eq!(display.spi.writes.len(), 12);
+    assert_eq!(display.spi.writes.len(), 10);
     assert!(display.spi.writes[5].iter().all(|byte| *byte == 0));
-    assert!(display.spi.writes[11].iter().all(|byte| *byte == 0));
+    assert!(display.spi.writes[9].iter().all(|byte| *byte == 0));
 }
 
 #[test]
@@ -124,7 +124,7 @@ fn valid_history_detects_changes_after_snapshot_capture_without_upload() {
         let mut history = DisplayState::new(history_storage);
         let mut display = display();
         run(framebuffer.draw_diff(&mut display, &mut history)).unwrap();
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
 
         framebuffer
             .draw_iter([Pixel(Point::new(18, 34), Rgb565::RED)])

@@ -9,8 +9,9 @@ use embassy_rp::{
     gpio::{Level, Output},
     spi,
 };
-use embassy_time::{Delay, Instant};
+use embassy_time::{Delay, Duration, Instant, block_for};
 use embedded_graphics::{Drawable, image::Image, pixelcolor::Rgb565, prelude::*};
+use embedded_hal_async::delay::DelayNs;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use st7365p_lcd::{FrameBuffer, ST7365P, framebuffer, spi::ReadWriteSpi};
 use tinybmp::Bmp;
@@ -18,12 +19,29 @@ use tinybmp::Bmp;
 const SCREEN_WIDTH: usize = 320;
 const SCREEN_HEIGHT: usize = 320;
 
+struct SpiDelay;
+
+impl DelayNs for SpiDelay {
+    async fn delay_ns(&mut self, nanos: u32) {
+        if nanos <= 1_000 {
+            block_for(Duration::from_nanos(u64::from(nanos)));
+        } else {
+            Delay.delay_ns(nanos).await;
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let mut config = spi::Config::default();
-    config.frequency = 32_000_000;
+    let write_frequency = if cfg!(feature = "fast-spi") {
+        37_500_000
+    } else {
+        32_000_000
+    };
+    config.frequency = write_frequency;
     let spi1 = spi::Spi::new(
         p.SPI1,
         p.PIN_10,
@@ -34,9 +52,10 @@ async fn main(_spawner: Spawner) {
         config.clone(),
     );
 
-    let spi_device = ExclusiveDevice::new(spi1, Output::new(p.PIN_13, Level::Low), Delay).unwrap();
+    let spi_device =
+        ExclusiveDevice::new(spi1, Output::new(p.PIN_13, Level::Low), SpiDelay).unwrap();
     let spi_device = ReadWriteSpi::new(spi_device, move |device, reads| {
-        config.frequency = if reads { 6_000_000 } else { 32_000_000 };
+        config.frequency = if reads { 6_000_000 } else { write_frequency };
         device.bus_mut().set_config(&config);
         Ok(())
     });

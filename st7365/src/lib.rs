@@ -31,6 +31,10 @@ const MAX_SCREEN_HEIGHT: usize = 480;
 const _: () = assert!(cfg!(target_endian = "little"));
 
 /// ST7365P driver to connect to TFT displays.
+///
+/// The SPI device must support `Operation::DelayNs` for write setup guards
+/// as well as scanline reads. Use a short non-yielding SPI delay provider when
+/// scheduling latency matters; retain long asynchronous reset/poll delays.
 pub struct ST7365P<SPI, DC, RST, DELAY>
 where
     SPI: SpiDevice,
@@ -56,6 +60,9 @@ where
     /// Global image offset
     dx: u16,
     dy: u16,
+
+    column_window: Option<(u16, u16)>,
+    row_window: Option<(u16, u16)>,
 
     /// Delay
     delay: DELAY,
@@ -103,6 +110,8 @@ where
             inverted,
             dx: 0,
             dy: 0,
+            column_window: None,
+            row_window: None,
             delay,
         }
     }
@@ -110,7 +119,10 @@ where
     /// Accesses the SPI device, for example to select a slower clock for reads.
     ///
     /// Finish configuration changes before issuing display commands.
+    /// Invalidates cached address windows before returning mutable access.
     pub fn spi_mut(&mut self) -> &mut SPI {
+        self.column_window = None;
+        self.row_window = None;
         &mut self.spi
     }
 
@@ -157,6 +169,8 @@ where
     where
         DELAY: DelayNs,
     {
+        self.column_window = None;
+        self.row_window = None;
         if let Some(rst) = &mut self.rst {
             rst.set_high().map_err(|_| ())?;
             self.delay.delay_ms(10).await;
@@ -168,10 +182,17 @@ where
     }
 
     async fn write_command(&mut self, command: Instruction, params: &[u8]) -> Result<(), ()> {
-        // delay amount empirically determined
-        self.delay.delay_ns(1).await;
+        match command {
+            Instruction::CASET => self.column_window = None,
+            Instruction::RASET => self.row_window = None,
+            Instruction::SWRESET | Instruction::MADCTL => {
+                self.column_window = None;
+                self.row_window = None;
+            }
+            _ => {}
+        }
         self.dc.set_low().map_err(|_| ())?;
-        self.spi.write(&[command as u8]).await.map_err(|_| ())?;
+        self.write_data(&[command as u8]).await?;
         if !params.is_empty() {
             self.start_data()?;
             self.write_data(params).await?;
@@ -184,9 +205,10 @@ where
     }
 
     async fn write_data(&mut self, data: &[u8]) -> Result<(), ()> {
-        // delay amount empirically determined
-        self.delay.delay_ns(1).await;
-        self.spi.write(data).await.map_err(|_| ())
+        self.spi
+            .transaction(&mut [Operation::DelayNs(1), Operation::Write(data)])
+            .await
+            .map_err(|_| ())
     }
 
     /// Writes a data word to the display.
@@ -329,9 +351,13 @@ where
     pub fn set_offset(&mut self, dx: u16, dy: u16) {
         self.dx = dx;
         self.dy = dy;
+        self.column_window = None;
+        self.row_window = None;
     }
 
     /// Sets the address window for the display.
+    /// Unchanged axes are reused. Reversed bounds and offset overflow return Err
+    /// without issuing commands or changing the cached window.
     pub async fn set_address_window(
         &mut self,
         sx: u16,
@@ -339,20 +365,38 @@ where
         ex: u16,
         ey: u16,
     ) -> Result<(), ()> {
-        let start_x = (sx + self.dx).to_be_bytes();
-        let end_x = (ex + self.dx).to_be_bytes();
-        let start_y = (sy + self.dy).to_be_bytes();
-        let end_y = (ey + self.dy).to_be_bytes();
-        self.write_command(
-            Instruction::CASET,
-            &[start_x[0], start_x[1], end_x[0], end_x[1]],
-        )
-        .await?;
-        self.write_command(
-            Instruction::RASET,
-            &[start_y[0], start_y[1], end_y[0], end_y[1]],
-        )
-        .await
+        if sx > ex || sy > ey {
+            return Err(());
+        }
+        let column_window = (
+            sx.checked_add(self.dx).ok_or(())?,
+            ex.checked_add(self.dx).ok_or(())?,
+        );
+        let row_window = (
+            sy.checked_add(self.dy).ok_or(())?,
+            ey.checked_add(self.dy).ok_or(())?,
+        );
+        let start_x = column_window.0.to_be_bytes();
+        let end_x = column_window.1.to_be_bytes();
+        let start_y = row_window.0.to_be_bytes();
+        let end_y = row_window.1.to_be_bytes();
+        if self.column_window != Some(column_window) {
+            self.write_command(
+                Instruction::CASET,
+                &[start_x[0], start_x[1], end_x[0], end_x[1]],
+            )
+            .await?;
+            self.column_window = Some(column_window);
+        }
+        if self.row_window != Some(row_window) {
+            self.write_command(
+                Instruction::RASET,
+                &[start_y[0], start_y[1], end_y[0], end_y[1]],
+            )
+            .await?;
+            self.row_window = Some(row_window);
+        }
+        Ok(())
     }
 
     /// Sets a pixel color at the given coords.
@@ -367,11 +411,22 @@ where
     pub async fn write_pixels<P: IntoIterator<Item = u16>>(&mut self, colors: P) -> Result<(), ()> {
         self.write_command(Instruction::RAMWR, &[]).await?;
         self.start_data()?;
+        let mut buffer = [0u16; 64];
+        let mut length = 0;
         for color in colors {
-            self.write_word(color).await?;
+            buffer[length] = color.swap_bytes();
+            length += 1;
+            if length == buffer.len() {
+                self.write_words_buffered(&buffer).await?;
+                length = 0;
+            }
+        }
+        if length != 0 {
+            self.write_words_buffered(&buffer[..length]).await?;
         }
         Ok(())
     }
+    /// Writes pre-swapped RGB565 words without copying (unlike `write_pixels`).
     pub async fn write_pixels_buffered(&mut self, colors: &[u16]) -> Result<(), ()> {
         self.write_command(Instruction::RAMWR, &[]).await?;
         self.start_data()?;

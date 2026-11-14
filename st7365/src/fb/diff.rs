@@ -4,7 +4,7 @@ use super::*;
 ///
 /// Storage is supplied by the caller: no extra framebuffer is allocated by the
 /// driver. Keep one state per framebuffer/display pair. Use only `draw_diff`
-/// for uploads while this state is valid, and invalidate it after display reset,
+/// or `draw_diff_dirty` for uploads while this state is valid, and invalidate it after display reset,
 /// orientation/offset changes, direct writes, or switching framebuffer instances.
 /// Access to the framebuffer, this state, and the display must be serialized.
 pub struct DisplayState<
@@ -69,11 +69,51 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
         RST: OutputPin,
         DELAY: DelayNs,
     {
+        self.draw_diff_impl(display, history, false).await
+    }
+
+    /// Compares only dirty tiles and invalid history before flushing.
+    ///
+    /// Use only when this framebuffer/history/display pair is updated exclusively
+    /// through this method or `draw_diff`. Do not clear dirty flags with snapshot
+    /// capture or another flush API between calls. If that happens, invalidate
+    /// history or call `draw_diff` to compare the entire frame again.
+    /// Error/cancellation recovery follows `draw_diff`; invalid history is never
+    /// skipped, even when the corresponding dirty flag has been cleared.
+    pub async fn draw_diff_dirty<SPI, DC, RST, DELAY, History: PixelStorage>(
+        &mut self,
+        display: &mut ST7365P<SPI, DC, RST, DELAY>,
+        history: &mut DisplayState<WIDTH, HEIGHT, SIZE, History>,
+    ) -> Result<(), ()>
+    where
+        SPI: SpiDevice,
+        DC: OutputPin,
+        RST: OutputPin,
+        DELAY: DelayNs,
+    {
+        self.draw_diff_impl(display, history, true).await
+    }
+
+    async fn draw_diff_impl<SPI, DC, RST, DELAY, History: PixelStorage>(
+        &mut self,
+        display: &mut ST7365P<SPI, DC, RST, DELAY>,
+        history: &mut DisplayState<WIDTH, HEIGHT, SIZE, History>,
+        dirty_only: bool,
+    ) -> Result<(), ()>
+    where
+        SPI: SpiDevice,
+        DC: OutputPin,
+        RST: OutputPin,
+        DELAY: DelayNs,
+    {
         for tile_y in 0..Self::TILES_Y {
             for tile_x in 0..Self::TILES_X {
                 let tile_index = tile_y * Self::TILES_X + tile_x;
                 if !history.valid_tiles[tile_index] {
                     self.dirty_tiles.set(tile_index, true);
+                    continue;
+                }
+                if dirty_only && !self.dirty_tiles[tile_index] {
                     continue;
                 }
                 let start_x = tile_x * TILE_SIZE;
@@ -106,11 +146,18 @@ impl<const WIDTH: usize, const HEIGHT: usize, const SIZE: usize, Storage: PixelS
                 }
                 let start_x = tile_x * TILE_SIZE;
                 let start_y = tile_y * TILE_SIZE;
+                let width = TILE_SIZE.min(WIDTH - start_x);
+                let mut row_buffer = [0; TILE_SIZE];
                 for row in start_y..(start_y + TILE_SIZE).min(HEIGHT) {
-                    for column in start_x..(start_x + TILE_SIZE).min(WIDTH) {
-                        let index = row * WIDTH + column;
-                        history.pixels.write(index, self.buffer.read(index));
-                    }
+                    let start = row * WIDTH + start_x;
+                    let pixels = match self.buffer.as_slice() {
+                        Some(pixels) => &pixels[start..start + width],
+                        None => {
+                            self.buffer.copy_into(start, &mut row_buffer[..width]);
+                            &row_buffer[..width]
+                        }
+                    };
+                    history.pixels.write_from(start, pixels);
                 }
                 history.valid_tiles.set(tile_index, true);
             }

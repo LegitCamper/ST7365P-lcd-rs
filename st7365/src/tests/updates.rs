@@ -23,7 +23,7 @@ fn identical_fills_preserve_pending_changes_without_dirtying_other_tiles() {
         let mut framebuffer = FrameBuffer::<33, 35, 1155, _>::with_storage(storage);
         let mut display = display();
         run(framebuffer.draw(&mut display)).unwrap();
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
         framebuffer.clear(Rgb565::BLACK).unwrap();
         framebuffer
             .fill_solid(
@@ -47,7 +47,7 @@ fn identical_fills_preserve_pending_changes_without_dirtying_other_tiles() {
             vec![8]
         );
         run(framebuffer.partial_draw_batched(&mut display)).unwrap();
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
         framebuffer
             .fill_solid(
                 &Rectangle::new(Point::new(32, 34), Size::new(5, 5)),
@@ -73,7 +73,7 @@ fn full_draw_error_or_cancellation_marks_clean_frame_for_partial_retry() {
         let mut framebuffer = FrameBuffer::<17, 19, 323, _>::with_storage(storage);
         let mut display = display();
         run(framebuffer.draw(&mut display)).unwrap();
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
         if cancelled {
             display.spi.pending_at = Some(5);
             let mut future = std::pin::pin!(framebuffer.draw(&mut display));
@@ -88,7 +88,7 @@ fn full_draw_error_or_cancellation_marks_clean_frame_for_partial_retry() {
         assert_eq!(framebuffer.dirty_tiles.count_ones(), 4);
         display.spi.pending_at = None;
         display.spi.fail_at = None;
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
         run(framebuffer.partial_draw_batched(&mut display)).unwrap();
         assert_eq!(display.spi.writes.len(), 6);
         assert!(!framebuffer.dirty_tiles.any());
@@ -130,7 +130,7 @@ fn dense_non_slice_storage_stays_batched_and_preserves_clean_pixels() {
             FrameBuffer::<320, 320, 102400, _>::with_storage(AtomicStorage::<102400>::new());
         let mut display = display();
         run(framebuffer.draw(&mut display)).unwrap();
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
         framebuffer
             .fill_solid(
                 &Rectangle::new(Point::zero(), Size::new(320, height)),
@@ -138,12 +138,10 @@ fn dense_non_slice_storage_stays_batched_and_preserves_clean_pixels() {
             )
             .unwrap();
         run(framebuffer.partial_draw_batched(&mut display)).unwrap();
-        assert_eq!(display.spi.writes.len(), height as usize / 16 * 6);
-        let payload: usize = display
-            .spi
-            .writes
-            .chunks_exact(6)
-            .map(|packet| packet[5].len())
+        assert_eq!(display.spi.writes.len(), 2 + height as usize / 16 * 4);
+        let payload: usize = packets(&display.spi.writes)
+            .iter()
+            .map(|packet| packet.4.len())
             .sum();
         assert_eq!(payload, 320 * height as usize * 2);
         assert!(!framebuffer.dirty_tiles.any());
@@ -162,14 +160,14 @@ fn vertical_batches_split_at_scratch_limit_and_preserve_failed_rectangles() {
             .unwrap();
         let mut display = display();
         if cancelled {
-            display.spi.pending_at = Some(11);
+            display.spi.pending_at = Some(9);
             let mut future = std::pin::pin!(framebuffer.partial_draw_batched(&mut display));
             assert!(future
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending());
         } else {
-            display.spi.fail_at = Some(11);
+            display.spi.fail_at = Some(9);
             assert_eq!(run(framebuffer.partial_draw_batched(&mut display)), Err(()));
         }
         assert_eq!(display.spi.writes[5].len(), 16 * 320 * 2);
@@ -177,7 +175,7 @@ fn vertical_batches_split_at_scratch_limit_and_preserve_failed_rectangles() {
         assert!(!framebuffer.dirty_tiles[..40].any());
         display.spi.fail_at = None;
         display.spi.pending_at = None;
-        display.spi.writes.clear();
+        display.spi_mut().writes.clear();
         run(framebuffer.partial_draw_batched(&mut display)).unwrap();
         assert_eq!(display.spi.writes.len(), 6);
         assert_eq!(display.spi.writes[5].len(), 16 * 160 * 2);

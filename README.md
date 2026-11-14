@@ -23,7 +23,7 @@ RDDID/RDDST is specific to those commands, not GSCAN.
 150 ns read clock period (6.66 MHz maximum) and 60 ns high/low times. Use 6 MHz or
 less. `SpiDevice` has no portable clock configuration API. The example wraps its
 Embassy `ExclusiveDevice` in `spi::ReadWriteSpi`, selecting clocks before each
-transaction using the HAL's existing configuration API:
+direction change using the HAL's existing configuration API:
 
 ```rust,ignore
 use st7365p_lcd::spi::ReadWriteSpi;
@@ -37,7 +37,9 @@ let mut display = ST7365P::new(device, dc, rst, false, true, Delay);
 ```
 
 The GSCAN command and response stay in one read-speed transaction. Writes select
-the write clock, including after an error. The callback requires an exclusively
+the write clock, including after an error. Successful consecutive transactions
+reuse their configuration. Errors, dropped futures, and `device_mut()` invalidate
+the clock cache. The callback requires an exclusively
 owned idle bus; it cannot reconfigure a shared bus outside its lock. After
 cancellation, recover CS/DMA if the underlying transport requires it before
 starting another transaction. Without this wrapper, keep synchronized drawing
@@ -47,6 +49,18 @@ rather than hanging. It logs render, sync-wait, and flush durations separately;
 these measurements do not substitute for worst-case packet timing calibration.
 The existing 32 MHz write clock is empirical, not a datasheet-rated guarantee
 (the documented write period is at least 66 ns).
+With the example's default 150 MHz peripheral clock, that request rounds down to
+25 MHz. The example's opt-in `fast-spi` feature requests an exact 37.5 MHz divider:
+`cargo +nightly build -p picocalc-rp2350 --release --target thumbv8m.main-none-eabihf --features fast-spi`.
+**37.5 MHz is an unverified overclock.** Validate your panel and wiring before
+using it; the default request remains unchanged. No hardware speedup is claimed.
+
+Write setup guards now use `Operation::DelayNs(1)` in the SPI transaction rather
+than a separate driver timer await. The SPI device must support delay operations;
+do not use a `new_no_delay` device. The PicoCalc example's `SpiDelay` busy-waits
+for delays up to 1 us, avoiding executor round trips while retaining the requested
+minimum delay. Longer delays still await the timer. Other SPI devices may still
+yield for their delays; measure your HAL rather than assuming zero overhead.
 
 - Stock PicoCalc V2.0 connects LCD SDO to GP12, but leaves TE unconnected. Use
   scanline polling there, not a made-up GPIO for TE. The panel must be awake.
@@ -58,7 +72,8 @@ The existing 32 MHz write clock is empirical, not a datasheet-rated guarantee
   visible height. Polling detects a wrap, not an exact zero sample; it can return
   shortly after vertical blanking starts, rather than precisely on its edge.
 - Starting in sync does **not** guarantee tear-free uploads: a 320x320 RGB565
-  frame takes at least 51.2 ms at 32 MHz, longer than a 60 Hz frame (16.7 ms).
+  frame takes at least 65.5 ms at the default example's actual 25 MHz, longer
+  than a 60 Hz frame (16.7 ms).
   Prefer small dirty updates; matching scan/write order and avoiding the panel
   catching the writer still matter. No automatic waits are added to existing
   drawing methods, and panel refresh settings are left unchanged.
@@ -167,10 +182,15 @@ display history. This handoff is separate from rectangle batching.
 Choose the flush API according to latency and tearing requirements:
 
 - `draw`: sends the entire framebuffer immediately, without scan synchronization.
-- `partial_draw`: sends dirty 16x16 tiles immediately.
+- `partial_draw`: deprecated unbatched path, retained for compatibility and its
+  smaller 512-byte scratch footprint.
 - `partial_draw_batched`: batches dirty rectangles for throughput, preserving
   clean tiles and borrowing full-width bands where possible.
 - `draw_diff`: suppresses unchanged final tiles using caller-owned display history.
+- `draw_diff_dirty`: compares only dirty tiles and invalid history. Use exclusively
+  with the same framebuffer/history/display pair; do not capture snapshots or
+  flush through other APIs between calls. After doing so, use `draw_diff` once
+  or invalidate history before resuming dirty-only comparisons.
 - `draw_sync`: sends only dirty tiles, checking GSCAN separately before each
   tile. If a tile is unsafe, it searches for another safe dirty tile before
   waiting. Staging finishes before the final validating scan sample. This trades throughput and latency
@@ -178,6 +198,23 @@ Choose the flush API according to latency and tearing requirements:
   drawing, even for an all-dirty frame.
 - `draw_sync_batched`: applies the same checks to bounded rectangular packets
   with an explicitly measured packet budget, never an unsynchronized fallback.
+
+For repeated batched flushes, reuse initialized scratch instead of zeroing 10 KiB
+on each call. `partial_draw_batched_with_scratch(&mut display, &mut scratch)` and
+`draw_sync_batched_with_scratch(&mut display, &sync, &batches, &mut scratch)` accept
+`let mut scratch = [0u16; 5120];` allocated once outside your render loop. Neither
+method reads unstaged scratch or sends padding. Ordinary methods retain their
+existing convenience allocation; no uninitialized memory is introduced.
+
+Direct `write_pixels`/`set_pixels` calls accept native RGB565 words and now send
+up to 64 pixels per transaction. Buffered methods still accept pre-swapped words
+and borrow them without copying. `set_pixel` remains a single-pixel operation.
+Unchanged CASET/RASET axes are cached; reset, orientation, offset changes, and
+`spi_mut()` invalidate the relevant cache. Interrupted address commands cannot
+leave their old cached axis valid. Invalid windows or offset overflow fail before
+I/O. Bulk contiguous drawing marks dirty state once per changed tile-row span;
+history commits use `PixelStorage::write_from`, with a slice-copy fast path and
+a default per-word implementation for custom storage.
 
 `draw_sync` needs a `ScanSyncConfig` calibrated for your panel and workload.
 There are deliberately no guessed refresh-rate, porch, or orientation defaults.
